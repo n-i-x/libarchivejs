@@ -100,19 +100,33 @@ void *get_filedata(void *archive, size_t buffsize){
     fprintf(stderr, "Failed to allocate %zu bytes for entry data\n", buffsize);
     return NULL;
   }
-  int read_size = archive_read_data(archive, buff, buffsize);
-  if (read_size < 0)
+  // archive_read_data is read(2)-like: it returns what it has, which for
+  // several formats (RAR in particular) is one decompressed block rather than
+  // everything asked for. Reading once and assuming the buffer was filled left
+  // the tail as uninitialized heap — an entry of exactly the right size with
+  // garbage in it. Loop until the entry is exhausted.
+  size_t total = 0;
+  while (total < buffsize)
   {
-    fprintf(stderr, "Error occured while reading file");
-    // Pointers are unsigned on the JS side, so a negative return can't be
-    // detected there; report the failure as NULL and don't leak the buffer.
-    free(buff);
-    return NULL;
+    la_ssize_t read_size = archive_read_data(archive, (char *)buff + total, buffsize - total);
+    if (read_size < 0)
+    {
+      fprintf(stderr, "Error occured while reading file");
+      // Pointers are unsigned on the JS side, so a negative return can't be
+      // detected there; report the failure as NULL and don't leak the buffer.
+      free(buff);
+      return NULL;
+    }
+    if (read_size == 0)
+    {
+      // End of entry before the declared size: zero the remainder rather than
+      // handing back whatever the heap held.
+      memset((char *)buff + total, 0, buffsize - total);
+      break;
+    }
+    total += (size_t)read_size;
   }
-  else
-  {
-    return buff;
-  }
+  return buff;
 }
 
 // Reads the next chunk of the current entry into a caller-owned buffer. Returns

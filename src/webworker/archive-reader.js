@@ -230,21 +230,46 @@ export class ArchiveReader {
     return entryData;
   }
 
+  // Reads an entry in full, a chunk at a time. Chunking matters for more than
+  // memory: archive_read_data returns what it has to hand, which for some
+  // formats (notably RAR) is a single decompressed block, so a one-shot read
+  // yields an entry of the right length whose tail was never written. Looping
+  // is also what makes the true decoded length knowable.
   _readWholeEntry(archive, size) {
-    // malloc(0) is allowed to return NULL, which would be indistinguishable from
-    // a failure; an empty entry has no data to read anyway.
     if (size === 0) {
       return new Uint8Array(0);
     }
-    const ptr = this._runCode.getFileData(archive, size);
-    if (ptr === 0) {
-      throw new Error(
-        this._runCode.getError(archive) || "Error reading entry data",
-      );
+
+    const chunkSize = Math.min(size, DEFAULT_CHUNK_SIZE);
+    const buff = this._runCode.malloc(chunkSize);
+    if (buff === 0) {
+      throw new Error(`Failed to allocate a ${chunkSize} byte read buffer`);
     }
-    const data = this._wasmModule.HEAPU8.slice(ptr, ptr + size);
-    this._wasmModule._free(ptr);
-    return data;
+
+    const out = new Uint8Array(size);
+    let total = 0;
+    try {
+      while (total < size) {
+        const want = Math.min(chunkSize, size - total);
+        const read = this._runCode.readDataChunk(archive, buff, want);
+        if (read < 0) {
+          throw new Error(
+            this._runCode.getError(archive) || "Error reading entry data",
+          );
+        }
+        if (read === 0) break;
+        // Re-read HEAPU8 each pass: memory growth can replace the buffer and
+        // detach any view held across the call.
+        out.set(this._wasmModule.HEAPU8.subarray(buff, buff + read), total);
+        total += read;
+      }
+    } finally {
+      this._runCode.free(buff);
+    }
+
+    // A short read means the entry ended early; report what was actually
+    // decoded rather than padding it out to the declared size.
+    return total === size ? out : out.subarray(0, total);
   }
 
   // Opens (or re-opens) the archive. Listing and extracting each start a fresh
