@@ -1,4 +1,10 @@
-FROM emscripten/emsdk
+# Pinned so a rebuild produces the same wasm. Upstream tracked `latest`, which
+# silently changes the toolchain (and with it the emitted glue) between builds.
+# Override with: docker build --build-arg EMSDK_VERSION=x.y.z
+# Note: the vendored openssl 1.0.2s is from 2019 and is the component most
+# likely to break against a much newer toolchain — bump this deliberately.
+ARG EMSDK_VERSION=3.1.74
+FROM emscripten/emsdk:${EMSDK_VERSION}
 
 WORKDIR /opt
 

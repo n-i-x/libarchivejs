@@ -38,6 +38,47 @@ void *archive_open(const void *buf, size_t size, const char *passphrase, const c
   return a;
 }
 
+// Block size used when reading an archive from the emscripten filesystem. Large
+// enough that a multi-gigabyte archive isn't read a page at a time, small enough
+// that it costs nothing for a small one.
+#define LA_FILE_BLOCK_SIZE (1024 * 1024)
+
+EMSCRIPTEN_KEEPALIVE
+void *archive_open_file(const char *path, const char *passphrase, const char *locale){
+  struct archive *a;
+  int r;
+
+  setlocale(LC_ALL, locale);
+
+  a = archive_read_new();
+  archive_read_support_filter_all(a);
+  archive_read_support_format_all(a);
+
+  if (passphrase)
+  {
+    archive_read_add_passphrase(a, passphrase);
+  }
+
+  // Unlike archive_read_open_memory, this gives libarchive a seekable stream, so
+  // formats whose directory lives at the end of the file (7z, zip) can be read
+  // without the whole archive being resident in wasm memory.
+  r = archive_read_open_filename(a, path, LA_FILE_BLOCK_SIZE);
+  if (r != ARCHIVE_OK)
+  {
+    fprintf(stderr, "File read error %d\n", r);
+    fprintf(stderr, "%s\n", archive_error_string(a));
+  }
+  return a;
+}
+
+// archive_entry_size returns la_int64_t, which cwrap's "number" truncates to 32
+// bits on wasm32 — a 3GB entry reads back as garbage. A double carries every
+// integer up to 2^53 exactly, so the size survives the boundary intact.
+EMSCRIPTEN_KEEPALIVE
+double get_entry_size(void *entry){
+  return (double)archive_entry_size((struct archive_entry *)entry);
+}
+
 EMSCRIPTEN_KEEPALIVE
 const void *get_next_entry(void *archive){
   struct archive_entry *entry;
@@ -54,11 +95,19 @@ const void *get_next_entry(void *archive){
 EMSCRIPTEN_KEEPALIVE
 void *get_filedata(void *archive, size_t buffsize){
   void *buff = malloc(buffsize);
+  if (buff == NULL)
+  {
+    fprintf(stderr, "Failed to allocate %zu bytes for entry data\n", buffsize);
+    return NULL;
+  }
   int read_size = archive_read_data(archive, buff, buffsize);
   if (read_size < 0)
   {
     fprintf(stderr, "Error occured while reading file");
-    return (void *)read_size;
+    // Pointers are unsigned on the JS side, so a negative return can't be
+    // detected there; report the failure as NULL and don't leak the buffer.
+    free(buff);
+    return NULL;
   }
   else
   {

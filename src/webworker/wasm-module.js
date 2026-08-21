@@ -28,6 +28,14 @@ export class WasmModule {
         "string",
         "string",
       ]),
+      // void * archive_open_file( const char * path, const char * passphrase, const char * locale )
+      // Opens an archive from the emscripten filesystem (seekable, read lazily)
+      // rather than from a heap buffer. Returns archive pointer.
+      openArchiveFile: this.cwrap("archive_open_file", "number", [
+        "string",
+        "string",
+        "string",
+      ]),
       // void * get_entry(void * archive)
       // return archive entry pointer
       getNextEntry: this.cwrap("get_next_entry", "number", ["number"]),
@@ -37,8 +45,10 @@ export class WasmModule {
       skipEntry: this.cwrap("archive_read_data_skip", "number", ["number"]),
       // void archive_close( void * archive )
       closeArchive: this.cwrap("archive_close", null, ["number"]),
-      // la_int64_t archive_entry_size( struct archive_entry * )
-      getEntrySize: this.cwrap("archive_entry_size", "number", ["number"]),
+      // double get_entry_size( const void * entry )
+      // Wraps archive_entry_size, whose la_int64_t return would be truncated to
+      // 32 bits by cwrap's "number" — entries above 2GB came back as garbage.
+      getEntrySize: this.cwrap("get_entry_size", "number", ["number"]),
       // const char * archive_entry_pathname_utf8( struct archive_entry * )
       getEntryName: this.cwrap("archive_entry_pathname", "string", ["number"]),
       // __LA_MODE_T archive_entry_filetype( struct archive_entry * )
@@ -117,7 +127,9 @@ export class WasmModule {
         "number",
         "string",
       ]),
-      string: (str) => this.allocate(this.intArrayFromString(str), "i8", 0),
+      // allocate()/intArrayFromString() were removed from the emscripten runtime
+      // in 3.1.44; stringToNewUTF8 is the supported equivalent (mallocs, caller frees).
+      string: (str) => this.stringToNewUTF8(str),
       malloc: this.cwrap("malloc", "number", ["number"]),
       free: this.cwrap("free", null, ["number"]),
       sizeOfSizeT: this.cwrap("size_of_size_t", "number", []),

@@ -98,6 +98,14 @@ To extract a single file from the archive you can use the `extract()` method on 
     const file = await filesObj['.gitignore'].extract();
 ```
 
+### Large archives
+
+Archives are read lazily from the input `File`/`Blob` rather than copied into
+wasm memory, so archive size is not bounded by the wasm heap — a multi-gigabyte
+`.zip` or `.7z` can be listed and extracted. In the browser this uses `WORKERFS`,
+which is available inside the worker where the archive is read; environments
+without it (nodejs) fall back to loading the archive into memory as before.
+
 ### Check for encrypted data
 
 ```js
