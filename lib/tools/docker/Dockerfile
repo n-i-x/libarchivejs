@@ -8,14 +8,12 @@ FROM emscripten/emsdk:${EMSDK_VERSION}
 
 WORKDIR /opt
 
-ADD https://github.com/libarchive/libarchive/releases/download/v3.7.2/libarchive-3.7.2.zip /opt
 ADD https://github.com/madler/zlib/releases/download/v1.3/zlib13.zip /opt
 ADD https://github.com/tukaani-project/xz/releases/download/v5.2.11/xz-5.2.11.tar.gz /opt
 ADD https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz /opt
 ADD https://www.openssl.org/source/openssl-1.0.2s.tar.gz /opt
 
-RUN unzip /opt/libarchive-3.7.2.zip && rm /opt/libarchive-3.7.2.zip && \
-    unzip /opt/zlib13.zip && rm /opt/zlib13.zip && \
+RUN unzip /opt/zlib13.zip && rm /opt/zlib13.zip && \
     tar xf /opt/xz-5.2.11.tar.gz && rm /opt/xz-5.2.11.tar.gz && \
     tar xf /opt/bzip2-1.0.8.tar.gz && rm /opt/bzip2-1.0.8.tar.gz && \
     tar xf /opt/openssl-1.0.2s.tar.gz && rm /opt/openssl-1.0.2s.tar.gz
@@ -50,10 +48,19 @@ WORKDIR /opt/xz-5.2.11
 RUN cd /opt/xz-5.2.11 && emconfigure ./configure --disable-assembler --enable-threads=no --enable-static=yes 2>&1 | tee conf.out && \
     emmake make 2>&1 | tee make.out && emmake make install
 
+# libarchive is fetched and built last, on its own layers, so bumping it doesn't
+# invalidate the codec builds above — those take the bulk of the build time and
+# never change. Override with: docker build --build-arg LIBARCHIVE_VERSION=x.y.z
+ARG LIBARCHIVE_VERSION=3.7.2
+ADD https://github.com/libarchive/libarchive/releases/download/v${LIBARCHIVE_VERSION}/libarchive-${LIBARCHIVE_VERSION}.zip /opt
+# -d matters: the working directory here is still the previous build's source
+# tree, and unzip would otherwise extract into it.
+RUN unzip -q /opt/libarchive-${LIBARCHIVE_VERSION}.zip -d /opt && rm /opt/libarchive-${LIBARCHIVE_VERSION}.zip
+
 # Compile libarchive to LLVM
 ENV EMCC_CFLAGS "-s USE_BZIP2=1"
-WORKDIR /opt/libarchive-3.7.2
-RUN cd /opt/libarchive-3.7.2 && emconfigure ./configure --enable-static --disable-shared --enable-bsdtar=static --enable-bsdcat=static \
+WORKDIR /opt/libarchive-${LIBARCHIVE_VERSION}
+RUN emconfigure ./configure --enable-static --disable-shared --enable-bsdtar=static --enable-bsdcat=static \
     --enable-bsdcpio=static --enable-posix-regex-lib=libc \
     --disable-xattr --disable-acl --without-nettle --without-lzo2 \
     --without-cng  --without-lz4 \
