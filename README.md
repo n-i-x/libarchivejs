@@ -98,6 +98,27 @@ To extract a single file from the archive you can use the `extract()` method on 
     const file = await filesObj['.gitignore'].extract();
 ```
 
+### Stream a single file from archive
+
+`extract()` returns the whole entry at once, so the entry has to fit in memory.
+When the contents can be consumed incrementally — hashing, uploading, piping to
+disk — use `stream()` instead, which decompresses a chunk at a time and never
+holds the entry in full. This is the only way to read entries larger than the
+wasm heap.
+
+```js
+    const filesObj = await archive.getFilesObject();
+    const stream = filesObj['big.iso'].stream(); // ReadableStream<Uint8Array>
+
+    for await (const chunk of stream) {
+      hash.update(chunk);
+    }
+```
+
+Reading the stream slowly pauses the worker rather than buffering without bound,
+and cancelling it stops the read. An optional `{ chunkSize }` overrides the
+default 4MB read buffer.
+
 ### Large archives
 
 Archives are read lazily from the input `File`/`Blob` rather than copied into

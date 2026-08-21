@@ -1,3 +1,4 @@
+import * as Comlink from "comlink/dist/esm/comlink.mjs";
 import { ArchiveReader } from "./archive-reader";
 import { ArchiveWriter } from "./archive-writer";
 import { getWasmModule } from "./wasm-module";
@@ -40,6 +41,20 @@ export class LibArchiveWorker {
         return entry;
       }
     }
+  }
+
+  /**
+   * Streams one entry's data to the caller a chunk at a time. Each chunk's
+   * buffer is transferred rather than copied, and the callback's resolution
+   * paces the read, so the consumer can apply backpressure.
+   * Resolves to the entry's metadata once the entry has been fully read.
+   */
+  streamSingleFile(target, onChunk, chunkSize) {
+    return reader.streamEntry(
+      target,
+      (chunk) => onChunk(Comlink.transfer(chunk, [chunk.buffer])),
+      chunkSize,
+    );
   }
 
   hasEncryptedData() {

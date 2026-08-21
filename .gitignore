@@ -1,1 +1,8 @@
 node_modules
+
+# Large test fixtures are generated on demand by test/large/*.mjs, never
+# committed — they run to gigabytes.
+test/files/archives/large.zip
+test/files/archives/large.7z
+test/files/archives/large-src/
+test/files/stock/

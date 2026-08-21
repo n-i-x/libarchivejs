@@ -5,6 +5,7 @@
     "_get_next_entry",
     "_get_entry_size",
     "_get_filedata",
+    "_read_data_chunk",
     "_archive_close", 
     "_archive_entry_filetype", 
     "_archive_entry_pathname", 

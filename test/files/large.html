@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+  <head>
+    <title>test large archive</title>
+  </head>
+  <body>
+    <input type="file" id="file" />
+    <script type="module">
+      function finish() {
+        const d = document.createElement("div");
+        d.setAttribute("id", "done");
+        d.textContent = "Done.";
+        document.body.appendChild(d);
+      }
+
+      import { Archive } from "/dist/libarchive.js";
+
+      Archive.init({
+        workerUrl: "/dist/worker-bundle.js",
+      });
+
+      const CRC_TABLE = (() => {
+        const table = new Int32Array(256);
+        for (let n = 0; n < 256; n++) {
+          let c = n;
+          for (let k = 0; k < 8; k++)
+            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+          table[n] = c;
+        }
+        return table;
+      })();
+
+      function crc32(buf, seed = 0) {
+        let c = ~seed;
+        for (let i = 0; i < buf.length; i++) {
+          c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+        }
+        return ~c >>> 0;
+      }
+
+      document.getElementById("file").addEventListener("change", async (e) => {
+        let obj = null;
+        try {
+          const file = e.currentTarget.files[0];
+          const archive = await Archive.open(file);
+          const entries = await archive.getFilesArray();
+
+          const large = entries.find((x) => x.file.name === "large.bin");
+          const after = entries.find((x) => x.file.name === "after.txt");
+
+          // Hash the oversized entry straight off the stream. Nothing here ever
+          // holds more than a chunk, so this must work for an entry far larger
+          // than the wasm heap.
+          let crc = 0;
+          let streamed = 0;
+          let maxChunk = 0;
+          const reader = large.file.stream().getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            crc = crc32(value, crc);
+            streamed += value.length;
+            if (value.length > maxChunk) maxChunk = value.length;
+          }
+
+          // Reading an entry whose local header sits past the 2GB mark.
+          const afterFile = await after.file.extract();
+
+          obj = {
+            listedSize: large.file.size,
+            streamedSize: streamed,
+            crc,
+            maxChunk,
+            afterText: await afterFile.text(),
+            afterSize: after.file.size,
+          };
+          await archive.close();
+        } catch (err) {
+          console.error(err);
+          obj = { error: String(err && err.message ? err.message : err) };
+        } finally {
+          window.obj = obj;
+          finish();
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -51,4 +51,14 @@ export class CompressedFile {
   extract() {
     return this._archiveRef.extractSingleFile(this._path);
   }
+
+  /**
+   * Stream the file's contents out of the archive without materializing it.
+   * Use this instead of extract() when the contents can be consumed
+   * incrementally (hashing, uploading), especially for very large entries.
+   * @returns {ReadableStream<Uint8Array>}
+   */
+  stream(options: { chunkSize?: number } = {}): ReadableStream<Uint8Array> {
+    return this._archiveRef.streamSingleFile(this._path, options);
+  }
 }

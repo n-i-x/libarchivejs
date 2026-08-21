@@ -41,6 +41,13 @@ export class WasmModule {
       getNextEntry: this.cwrap("get_next_entry", "number", ["number"]),
       // void * get_filedata( void * archive, size_t bufferSize )
       getFileData: this.cwrap("get_filedata", "number", ["number", "number"]),
+      // int read_data_chunk( void * archive, void * buff, size_t buffsize )
+      // bytes read, 0 at end of entry, negative on error
+      readDataChunk: this.cwrap("read_data_chunk", "number", [
+        "number",
+        "number",
+        "number",
+      ]),
       // int archive_read_data_skip(struct archive *_a)
       skipEntry: this.cwrap("archive_read_data_skip", "number", ["number"]),
       // void archive_close( void * archive )

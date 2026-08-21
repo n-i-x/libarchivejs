@@ -115,6 +115,16 @@ void *get_filedata(void *archive, size_t buffsize){
   }
 }
 
+// Reads the next chunk of the current entry into a caller-owned buffer. Returns
+// the number of bytes read, 0 at end of entry, or a negative libarchive error.
+// Lets a caller stream an entry of any size through a fixed-size buffer instead
+// of materializing the whole thing, which get_filedata cannot do beyond the
+// 32-bit heap.
+EMSCRIPTEN_KEEPALIVE
+int read_data_chunk(void *archive, void *buff, size_t buffsize){
+  return (int)archive_read_data(archive, buff, buffsize);
+}
+
 EMSCRIPTEN_KEEPALIVE
 void archive_close(void *archive){
   int r = archive_read_free(archive);

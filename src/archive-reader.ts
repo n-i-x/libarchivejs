@@ -107,16 +107,89 @@ export class ArchiveReader {
     });
   }
 
+  /**
+   * Streams a single entry's data. The entry is decompressed a chunk at a time
+   * and never held in wasm memory in full, so entries larger than the wasm heap
+   * can be read. Reading the stream slowly pauses the worker rather than
+   * buffering without bound.
+   */
+  streamSingleFile(
+    target: string,
+    options: { chunkSize?: number } = {},
+  ): ReadableStream<Uint8Array> {
+    if (this.worker === null) {
+      throw new Error("Archive already closed");
+    }
+
+    let releasePull: (() => void) | null = null;
+    // Set when a pull arrives while the worker isn't parked — enqueue can satisfy
+    // a pending read and trigger `pull` synchronously, before there is anything
+    // to release. Without this the next chunk would wait for a pull that already
+    // happened.
+    let pullPending = false;
+    let cancelled = false;
+
+    return new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        const onChunk = Comlink.proxy(async (chunk: Uint8Array) => {
+          if (cancelled) return false;
+          controller.enqueue(chunk);
+          // Hold the worker here while the consumer is behind; `pull` releases it.
+          if ((controller.desiredSize ?? 1) <= 0 && !pullPending) {
+            await new Promise<void>((resolve) => {
+              releasePull = resolve;
+            });
+          }
+          pullPending = false;
+          return !cancelled;
+        });
+
+        this.client
+          .streamSingleFile(target, onChunk, options.chunkSize)
+          .then(() => {
+            if (!cancelled) controller.close();
+          })
+          .catch((err: any) => {
+            if (!cancelled) controller.error(err);
+          });
+      },
+      pull: () => {
+        if (releasePull) {
+          releasePull();
+          releasePull = null;
+        } else {
+          pullPending = true;
+        }
+      },
+      cancel: () => {
+        // Unblock the worker so it observes the cancellation and stops reading.
+        cancelled = true;
+        releasePull?.();
+        releasePull = null;
+      },
+    });
+  }
+
   async extractSingleFile(target: string): Promise<File> {
     // Prevent extraction if worker already terminated
     if (this.worker === null) {
       throw new Error("Archive already closed");
     }
 
-    const fileEntry = await this.client.extractSingleFile(target);
-    return new File([fileEntry.fileData], fileEntry.fileName, {
+    // Collected as chunks and handed to the File constructor as separate parts:
+    // the browser backs a large Blob with disk storage, whereas the previous
+    // single-buffer transfer had to fit the whole entry in memory twice.
+    const chunks: Uint8Array[] = [];
+    const entry = await this.client.streamSingleFile(
+      target,
+      Comlink.proxy((chunk: Uint8Array) => {
+        chunks.push(chunk);
+      }),
+    );
+
+    return new File(chunks, entry.fileName, {
       type: "application/octet-stream",
-      lastModified: fileEntry.lastModified / 1_000_000,
+      lastModified: entry.lastModified / 1_000_000,
     });
   }
 

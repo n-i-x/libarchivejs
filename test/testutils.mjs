@@ -20,13 +20,17 @@ const startServer = () =>
   });
 
 export const setup = async () => {
+  // Chrome's sandbox needs user namespaces, which are unavailable in most CI
+  // containers; opt out there with PUPPETEER_NO_SANDBOX=1 rather than losing the
+  // sandbox for everyone.
+  const extraArgs = process.env.PUPPETEER_NO_SANDBOX === "1" ? ["--no-sandbox"] : [];
   let browser = isWsl
     ? await puppeteer.launch({
         headless: "new",
         executablePath: "google-chrome",
         args: ["--no-sandbox"],
       })
-    : await puppeteer.launch({ headless: "new" });
+    : await puppeteer.launch({ headless: "new", args: extraArgs });
 
   let page = await browser.newPage();
   await page.setViewport({ width, height });

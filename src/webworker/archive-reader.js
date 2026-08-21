@@ -11,6 +11,11 @@ const TYPE_MAP = {
 // Where the input archive is mounted inside the emscripten filesystem.
 const MOUNT_POINT = "/libarchivejs";
 
+// Size of the bounce buffer used to stream an entry out of wasm memory. This is
+// the only entry-proportional allocation left in the read path, so it bounds
+// peak heap use regardless of how large the entry is.
+const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
+
 // WORKERFS reads Blob slices synchronously via FileReaderSync, which only exists
 // inside a worker. Everywhere else (node, or a wasm build without the FS shipped)
 // we fall back to loading the archive into the heap as before.
@@ -151,6 +156,61 @@ export class ArchiveReader {
       }
       yield entryData;
     }
+  }
+
+  /**
+   * Stream a single entry's data out in chunks, without ever holding the whole
+   * entry in memory. onChunk receives a Uint8Array and may return false (or a
+   * promise resolving to false) to stop early.
+   * @param {string} target entry path
+   * @param {Function} onChunk
+   * @param {number} chunkSize
+   * @returns {Promise<object>} the entry's metadata
+   */
+  async streamEntry(target, onChunk, chunkSize = DEFAULT_CHUNK_SIZE) {
+    const archive = this._openArchive();
+
+    let meta = null;
+    let entry;
+    while ((entry = this._runCode.getNextEntry(archive)) !== 0) {
+      const path = this._runCode.getEntryName(entry);
+      if (path !== target) {
+        this._runCode.skipEntry(archive);
+        continue;
+      }
+      meta = this._entryData(entry);
+      break;
+    }
+
+    if (meta === null) {
+      throw new Error(`Entry not found in archive: ${target}`);
+    }
+
+    const buff = this._runCode.malloc(chunkSize);
+    if (buff === 0) {
+      throw new Error(`Failed to allocate a ${chunkSize} byte read buffer`);
+    }
+
+    try {
+      for (;;) {
+        const read = this._runCode.readDataChunk(archive, buff, chunkSize);
+        if (read === 0) break;
+        if (read < 0) {
+          throw new Error(
+            this._runCode.getError(archive) || "Error reading entry data",
+          );
+        }
+        // Re-read HEAPU8 every pass: the heap can be replaced by memory growth,
+        // which detaches any view held across the call.
+        const chunk = this._wasmModule.HEAPU8.slice(buff, buff + read);
+        const proceed = await onChunk(chunk);
+        if (proceed === false) break;
+      }
+    } finally {
+      this._runCode.free(buff);
+    }
+
+    return meta;
   }
 
   _entryData(entry) {
