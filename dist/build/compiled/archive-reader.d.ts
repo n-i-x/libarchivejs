@@ -41,6 +41,15 @@ export declare class ArchiveReader {
      */
     getFilesObject(): Promise<any>;
     getFilesArray(): Promise<any[]>;
+    /**
+     * Streams a single entry's data. The entry is decompressed a chunk at a time
+     * and never held in wasm memory in full, so entries larger than the wasm heap
+     * can be read. Reading the stream slowly pauses the worker rather than
+     * buffering without bound.
+     */
+    streamSingleFile(target: string, options?: {
+        chunkSize?: number;
+    }): ReadableStream<Uint8Array>;
     extractSingleFile(target: string): Promise<File>;
     /**
      * Returns object containing directory structure and extracted File objects
