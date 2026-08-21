@@ -16,6 +16,22 @@ export class WasmModule {
     console.error(text);
   }
 
+  // The wasm sits next to this worker bundle and is fetched by URL, so a
+  // deployment that cache-busts the worker (a `?v=` query, say) would otherwise
+  // still get whatever libarchive.wasm the browser had cached. A fresh worker
+  // paired with a stale wasm is worse than both being stale — it calls exports
+  // that don't exist yet. Carry the worker's own query across to the wasm so the
+  // two are always fetched as a matched pair.
+  locateFile(path, prefix) {
+    let search = "";
+    try {
+      search = new URL(import.meta.url).search;
+    } catch {
+      // No module URL (bundled to CJS, or running under node) — nothing to carry.
+    }
+    return `${prefix}${path}${search}`;
+  }
+
   initFunctions() {
     this.runCode = {
       // const char * get_version()
