@@ -52,9 +52,7 @@ describe("Extract file using nodejs", () => {
   }, 30000);
 
   test("Extract password-protected RAR4 data", async () => {
-    const buffer = fs.readFileSync(
-      "test/files/archives/rar/encrypted-v4.rar",
-    );
+    const buffer = fs.readFileSync("test/files/archives/rar/encrypted-v4.rar");
     const archive = await Archive.open(new Blob([buffer]));
 
     await archive.usePassword("rar4-secret");
@@ -66,6 +64,38 @@ describe("Extract file using nodejs", () => {
       "pattern.bin":
         "6fc179cfd193754e6109ad043f56d146c7e7d7c3623ffceae318266286f58388",
     });
+    await archive.close();
+  }, 30000);
+
+  test("Extract RAR4 data with encrypted headers", async () => {
+    const buffer = fs.readFileSync(
+      "test/files/archives/rar/encrypted-headers-v4.rar",
+    );
+    const archive = await Archive.open(new Blob([buffer]));
+
+    expect(await archive.hasEncryptedData()).toBe(true);
+    await archive.usePassword("rar4-hp-secret");
+    const checksumObj = await fileChecksums(await archive.extractFiles());
+
+    expect(checksumObj).toEqual({
+      "hidden-message.txt":
+        "a9860f0761847e672a7ff5d5765f40ec442117a88c8b45d91c9dd59c993b414c",
+      "hidden-pattern.bin":
+        "8f1e5639867efc9161bd2ee5634b6d120db21192c8fb43996016ff9b91444de4",
+    });
+    await archive.close();
+  }, 30000);
+
+  test("Reject an incorrect RAR4 encrypted-header password", async () => {
+    const buffer = fs.readFileSync(
+      "test/files/archives/rar/encrypted-headers-v4.rar",
+    );
+    const archive = await Archive.open(new Blob([buffer]));
+
+    await archive.usePassword("wrong");
+    await expect(archive.extractFiles()).rejects.toThrow(
+      /passphrase|encrypted RAR4 header/i,
+    );
     await archive.close();
   }, 30000);
 

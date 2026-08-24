@@ -55,6 +55,13 @@ export class WasmModule {
       // void * get_entry(void * archive)
       // return archive entry pointer
       getNextEntry: this.cwrap("get_next_entry", "number", ["number"]),
+      // int read_next_entry(void *archive, void **entry)
+      // Returns libarchive's status separately so EOF is distinguishable from
+      // a corrupt header or incorrect metadata password.
+      readNextEntry: this.cwrap("read_next_entry", "number", [
+        "number",
+        "number",
+      ]),
       // void * get_filedata( void * archive, size_t bufferSize )
       getFileData: this.cwrap("get_filedata", "number", ["number", "number"]),
       // int read_data_chunk( void * archive, void * buff, size_t buffsize )

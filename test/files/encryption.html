@@ -25,7 +25,10 @@
           const file = e.currentTarget.files[0];
           const archive = await Archive.open(file);
           encEntries = await archive.hasEncryptedData();
-          await archive.usePassword("nika");
+          const password =
+            new URLSearchParams(window.location.search).get("password") ??
+            "nika";
+          await archive.usePassword(password);
           obj = await archive.extractFiles();
           obj = await fileChecksums(obj);
         } catch (err) {

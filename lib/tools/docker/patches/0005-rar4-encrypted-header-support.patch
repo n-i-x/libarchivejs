@@ -1,0 +1,426 @@
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -393,6 +393,17 @@
+    */
+   int has_encrypted_entries;
+ 
++  /* Decrypted RAR3/RAR4 header currently being parsed. */
++  struct {
++    int enabled;
++    int serving;
++    uint8_t *buf;
++    size_t buf_cap;
++    size_t buf_len;
++    size_t buf_pos;
++    char *password;
++  } hdrcrypt;
++
+   /* Streaming AES-CBC state for an encrypted RAR3/RAR4 entry. */
+   struct {
+     int active;
+@@ -430,7 +441,12 @@
+ 
+ #define RAR4_CRYPT_BLOCK 16
+ #define RAR4_DATA_WINDOW (64 * 1024)
++#define RAR4_MAX_HEADER (2 * 1024 * 1024)
++#define RAR4_MAX_PASSPHRASE_TRIES 100
+ 
++static const void *rar4_header_ahead(struct archive_read *, size_t, ssize_t *);
++static int64_t rar4_header_consume(struct archive_read *, int64_t);
++static int rar4_header_prepare(struct archive_read *, struct rar *);
+ static int rar4_datacrypt_start(struct archive_read *, struct rar *);
+ static int rar4_datacrypt_fill(struct archive_read *, struct rar *, size_t);
+ static int64_t rar4_consume(struct archive_read *, int64_t);
+@@ -702,6 +718,190 @@
+   return 0;
+ }
+ 
++/* Try one password against the CRC stored inside an encrypted header. */
++static int
++rar4_header_try_password(struct archive_read *a, struct rar *rar,
++    const uint8_t salt[8], const char *password, size_t *cipher_len)
++{
++  archive_cbc_ctx ctx = NULL;
++  const uint8_t *cipher;
++  uint8_t key[16], iv[16], first[RAR4_CRYPT_BLOCK];
++  size_t header_size, padded_size, out_len;
++  uint32_t crc;
++  int ret;
++
++  if (rar4_derive_key(password, salt, 8, key, iv) != 0)
++    return ARCHIVE_RETRY;
++  cipher = __archive_read_ahead(a, RAR4_CRYPT_BLOCK, NULL);
++  if (cipher == NULL)
++    return ARCHIVE_RETRY;
++
++  ret = archive_decrypto_aes_cbc_init(&ctx, key, sizeof(key), iv);
++  if (ret != 0) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        ret == CRYPTOR_STUB_FUNCTION
++          ? "Decryption is unsupported due to lack of crypto library"
++          : "Failed to initialize RAR4 header decryption");
++    return ARCHIVE_FATAL;
++  }
++  out_len = sizeof(first);
++  ret = archive_decrypto_aes_cbc_update(&ctx, cipher,
++      RAR4_CRYPT_BLOCK, first, &out_len);
++  archive_decrypto_aes_cbc_release(&ctx);
++  if (ret != 0 || out_len != sizeof(first))
++    return ARCHIVE_RETRY;
++
++  header_size = archive_le16dec(first + 5);
++  if (header_size < 7 || header_size > RAR4_MAX_HEADER)
++    return ARCHIVE_RETRY;
++  padded_size = (header_size + RAR4_CRYPT_BLOCK - 1) &
++      ~(size_t)(RAR4_CRYPT_BLOCK - 1);
++  cipher = __archive_read_ahead(a, padded_size, NULL);
++  if (cipher == NULL)
++    return ARCHIVE_RETRY;
++
++  if (rar->hdrcrypt.buf_cap < padded_size) {
++    uint8_t *newbuf = realloc(rar->hdrcrypt.buf, padded_size);
++    if (newbuf == NULL) {
++      archive_set_error(&a->archive, ENOMEM,
++          "Cannot allocate memory for decrypted RAR4 header");
++      return ARCHIVE_FATAL;
++    }
++    rar->hdrcrypt.buf = newbuf;
++    rar->hdrcrypt.buf_cap = padded_size;
++  }
++
++  ret = archive_decrypto_aes_cbc_init(&ctx, key, sizeof(key), iv);
++  memset(key, 0, sizeof(key));
++  memset(iv, 0, sizeof(iv));
++  if (ret != 0) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        "Failed to initialize RAR4 header decryption");
++    return ARCHIVE_FATAL;
++  }
++  out_len = padded_size;
++  ret = archive_decrypto_aes_cbc_update(&ctx, cipher, padded_size,
++      rar->hdrcrypt.buf, &out_len);
++  archive_decrypto_aes_cbc_release(&ctx);
++  if (ret != 0 || out_len != padded_size)
++    return ARCHIVE_RETRY;
++
++  crc = crc32(0, rar->hdrcrypt.buf + 2, (unsigned)header_size - 2);
++  if ((crc & 0xffff) != archive_le16dec(rar->hdrcrypt.buf))
++    return ARCHIVE_RETRY;
++
++  rar->hdrcrypt.buf_len = header_size;
++  rar->hdrcrypt.buf_pos = 0;
++  *cipher_len = padded_size;
++  return ARCHIVE_OK;
++}
++
++/*
++ * RAR4 -hp encrypts every header after MAIN_HEAD independently. Each block
++ * starts with an eight-byte salt and its ciphertext is rounded up to the AES
++ * block size. Decrypt the complete header so its encoded size can be hidden
++ * too, then let the existing parser consume it through the wrappers below.
++ */
++static int
++rar4_header_prepare(struct archive_read *a, struct rar *rar)
++{
++  const uint8_t *p;
++  uint8_t salt[8];
++  const char *password;
++  size_t cipher_len = 0;
++  unsigned tries = 0;
++  int ret = ARCHIVE_RETRY;
++
++  if (!rar->hdrcrypt.enabled || rar->hdrcrypt.serving)
++    return ARCHIVE_OK;
++  p = __archive_read_ahead(a, sizeof(salt), NULL);
++  if (p == NULL)
++    return ARCHIVE_EOF;
++  memcpy(salt, p, sizeof(salt));
++  if (__archive_read_consume(a, sizeof(salt)) != (int64_t)sizeof(salt))
++    return ARCHIVE_FATAL;
++
++  if (rar->hdrcrypt.password != NULL) {
++    ret = rar4_header_try_password(a, rar, salt,
++        rar->hdrcrypt.password, &cipher_len);
++  } else {
++    __archive_read_reset_passphrase(a);
++    while (tries++ < RAR4_MAX_PASSPHRASE_TRIES &&
++        (password = __archive_read_next_passphrase(a)) != NULL) {
++      if (password[0] == '\0')
++        continue;
++      ret = rar4_header_try_password(a, rar, salt, password, &cipher_len);
++      if (ret == ARCHIVE_OK) {
++        rar->hdrcrypt.password = strdup(password);
++        if (rar->hdrcrypt.password == NULL) {
++          archive_set_error(&a->archive, ENOMEM,
++              "Cannot cache verified RAR4 passphrase");
++          return ARCHIVE_FATAL;
++        }
++        break;
++      }
++      if (ret == ARCHIVE_FATAL)
++        return ret;
++    }
++  }
++
++  if (ret != ARCHIVE_OK) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++        tries <= 1 && rar->hdrcrypt.password == NULL
++          ? "Passphrase required for encrypted RAR4 headers"
++          : "Incorrect passphrase or corrupt encrypted RAR4 header");
++    return ARCHIVE_FATAL;
++  }
++  if (__archive_read_consume(a, (int64_t)cipher_len) !=
++      (int64_t)cipher_len)
++    return ARCHIVE_FATAL;
++  rar->hdrcrypt.serving = 1;
++  return ARCHIVE_OK;
++}
++
++static const void *
++rar4_header_ahead(struct archive_read *a, size_t min, ssize_t *avail)
++{
++  struct rar *rar = a->format->data;
++  size_t remaining;
++
++  if (!rar->hdrcrypt.serving)
++    return __archive_read_ahead(a, min, avail);
++  remaining = rar->hdrcrypt.buf_len - rar->hdrcrypt.buf_pos;
++  if (min > remaining)
++    return NULL;
++  if (avail != NULL)
++    *avail = (ssize_t)remaining;
++  return rar->hdrcrypt.buf + rar->hdrcrypt.buf_pos;
++}
++
++static int64_t
++rar4_header_consume(struct archive_read *a, int64_t count)
++{
++  struct rar *rar = a->format->data;
++  size_t remaining;
++  int64_t consumed;
++
++  if (!rar->hdrcrypt.serving)
++    return __archive_read_consume(a, count);
++  if (count < 0)
++    return -1;
++  remaining = rar->hdrcrypt.buf_len - rar->hdrcrypt.buf_pos;
++  if ((uint64_t)count <= remaining) {
++    rar->hdrcrypt.buf_pos += (size_t)count;
++    if (rar->hdrcrypt.buf_pos == rar->hdrcrypt.buf_len)
++      rar->hdrcrypt.serving = 0;
++    return count;
++  }
++
++  rar->hdrcrypt.buf_pos = rar->hdrcrypt.buf_len;
++  rar->hdrcrypt.serving = 0;
++  consumed = __archive_read_consume(a, count - (int64_t)remaining);
++  if (consumed < 0)
++    return consumed;
++  return (int64_t)remaining + consumed;
++}
++
+ /*
+  * Bit stream reader.
+  */
+@@ -978,8 +1178,11 @@
+   size_t salt_len = (rar->file_flags & FHD_SALT) ? sizeof(rar->salt) : 0;
+   int cache_match;
+ 
+-  __archive_read_reset_passphrase(a);
+-  password = __archive_read_next_passphrase(a);
++  password = rar->hdrcrypt.password;
++  if (password == NULL) {
++    __archive_read_reset_passphrase(a);
++    password = __archive_read_next_passphrase(a);
++  }
+   if (password == NULL || password[0] == '\0') {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+         "Passphrase required for this entry");
+@@ -1364,10 +1567,16 @@
+     rar->has_encrypted_entries = 0;
+   }
+ 
++  if (rar->hdrcrypt.enabled && !rar->hdrcrypt.serving) {
++    ret = rar4_header_prepare(a, rar);
++    if (ret != ARCHIVE_OK)
++      return ret;
++  }
++
+   /* RAR files can be generated without EOF headers, so return ARCHIVE_EOF if
+   * this fails.
+   */
+-  if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
++  if ((h = rar4_header_ahead(a, 7, NULL)) == NULL)
+     return (ARCHIVE_EOF);
+ 
+   p = h;
+@@ -1384,7 +1593,14 @@
+   {
+     unsigned long crc32_val;
+ 
+-    if ((h = __archive_read_ahead(a, 7, NULL)) == NULL) {
++    if (rar->hdrcrypt.enabled && !rar->hdrcrypt.serving) {
++      ret = rar4_header_prepare(a, rar);
++      if (ret == ARCHIVE_EOF)
++        return ret;
++      if (ret != ARCHIVE_OK)
++        return ret;
++    }
++    if ((h = rar4_header_ahead(a, 7, NULL)) == NULL) {
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                         "Failed to read next header");
+       return (ARCHIVE_FATAL);
+@@ -1400,7 +1616,7 @@
+           "Invalid marker header");
+         return (ARCHIVE_FATAL);
+       }
+-      __archive_read_consume(a, 7);
++      rar4_header_consume(a, 7);
+       break;
+ 
+     case MAIN_HEAD:
+@@ -1411,7 +1627,7 @@
+           "Invalid header size");
+         return (ARCHIVE_FATAL);
+       }
+-      if ((h = __archive_read_ahead(a, skip, NULL)) == NULL)
++      if ((h = rar4_header_ahead(a, skip, NULL)) == NULL)
+         return (ARCHIVE_FATAL);
+       p = h;
+       memcpy(rar->reserved1, p + 7, sizeof(rar->reserved1));
+@@ -1428,16 +1644,12 @@
+                             sizeof(rar->reserved2));
+       }
+ 
+-      /* Main header is password encrypted, so we cannot read any
+-         file names or any other info about files from the header. */
+       if (rar->main_flags & MHD_PASSWORD)
+       {
+         archive_entry_set_is_metadata_encrypted(entry, 1);
+         archive_entry_set_is_data_encrypted(entry, 1);
+         rar->has_encrypted_entries = 1;
+-         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                          "RAR encryption support unavailable");
+-        return (ARCHIVE_FATAL);
++        rar->hdrcrypt.enabled = 1;
+       }
+ 
+       crc32_val = crc32(0, (const unsigned char *)p + 2, (unsigned)skip - 2);
+@@ -1448,7 +1660,7 @@
+         return (ARCHIVE_FATAL);
+ #endif
+       }
+-      __archive_read_consume(a, skip);
++      rar4_header_consume(a, skip);
+       break;
+ 
+     case FILE_HEAD:
+@@ -1474,7 +1686,7 @@
+             "Invalid header size too small");
+           return (ARCHIVE_FATAL);
+         }
+-        if ((h = __archive_read_ahead(a, skip, NULL)) == NULL)
++        if ((h = rar4_header_ahead(a, skip, NULL)) == NULL)
+           return (ARCHIVE_FATAL);
+         p = h;
+         skip += archive_le32dec(p + 7);
+@@ -1482,7 +1694,7 @@
+ 
+       /* Skip over the 2-byte CRC at the beginning of the header. */
+       crc32_expected = archive_le16dec(p);
+-      __archive_read_consume(a, 2);
++      rar4_header_consume(a, 2);
+       skip -= 2;
+ 
+       /* Skim the entire header and compute the CRC. */
+@@ -1493,14 +1705,14 @@
+           to_read = 32 * 1024;
+         else
+           to_read = (unsigned)skip;
+-        if ((h = __archive_read_ahead(a, to_read, NULL)) == NULL) {
++        if ((h = rar4_header_ahead(a, to_read, NULL)) == NULL) {
+           archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+             "Bad RAR file");
+           return (ARCHIVE_FATAL);
+         }
+         p = h;
+         crc32_val = crc32(crc32_val, (const unsigned char *)p, to_read);
+-        __archive_read_consume(a, to_read);
++        rar4_header_consume(a, to_read);
+         skip -= to_read;
+       }
+       if ((crc32_val & 0xffff) != crc32_expected) {
+@@ -1796,6 +2008,8 @@
+   free(rar->dbo);
+   free(rar->unp_buffer);
+   free(rar->lzss.window);
++  free(rar->hdrcrypt.buf);
++  free(rar->hdrcrypt.password);
+   free(rar->datacrypt.buf);
+   free(rar->datacrypt.cached_password);
+   __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
+@@ -1839,7 +2053,7 @@
+   }
+ 
+ 
+-  if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
++  if ((h = rar4_header_ahead(a, 7, NULL)) == NULL)
+     return (ARCHIVE_FATAL);
+   p = h;
+   memcpy(&rar_header, p, sizeof(rar_header));
+@@ -1851,7 +2065,7 @@
+     return (ARCHIVE_FATAL);
+   }
+   crc32_computed = crc32(0, (const unsigned char *)p + 2, 7 - 2);
+-  __archive_read_consume(a, 7);
++  rar4_header_consume(a, 7);
+ 
+   if (!(rar->file_flags & FHD_SOLID))
+   {
+@@ -1880,7 +2094,7 @@
+     return (ARCHIVE_FATAL);
+   }
+ 
+-  if ((h = __archive_read_ahead(a, (size_t)header_size - 7, NULL)) == NULL)
++  if ((h = rar4_header_ahead(a, (size_t)header_size - 7, NULL)) == NULL)
+   {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Failed to read full header content");
+@@ -1910,6 +2124,9 @@
+ 
+   rar->file_crc = archive_le32dec(file_header.file_crc);
+ 
++  if (rar->hdrcrypt.enabled)
++    archive_entry_set_is_metadata_encrypted(entry, 1);
++
+   if (rar->file_flags & FHD_PASSWORD)
+   {
+     archive_entry_set_is_data_encrypted(entry, 1);
+@@ -1956,7 +2173,8 @@
+                         "Invalid RAR file: Overlarge extended header");
+       return (ARCHIVE_FATAL);
+     }
+-    if (__archive_read_consume(a, header_size + rar->packed_size - 7) < 0) {
++    if (rar4_header_consume(a,
++        header_size + rar->packed_size - 7) < 0) {
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                         "Invalid RAR file: Cannot read extended header data");
+       return (ARCHIVE_FATAL);
+@@ -2126,7 +2344,7 @@
+     filename_size == rar->filename_save_size &&
+     !memcmp(rar->filename, rar->filename_save, filename_size + 1))
+   {
+-    __archive_read_consume(a, header_size - 7);
++    rar4_header_consume(a, header_size - 7);
+     rar->br.avail_in = 0;
+     rar->br.next_in = NULL;
+     rar->cursor++;
+@@ -2209,7 +2427,7 @@
+     }
+   }
+ 
+-  __archive_read_consume(a, header_size - 7);
++  rar4_header_consume(a, header_size - 7);
+   if (rar->packed_size > INT64_MAX - a->filter->position) {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Unable to store offsets");

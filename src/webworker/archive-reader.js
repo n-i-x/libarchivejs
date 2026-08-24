@@ -16,6 +16,10 @@ const MOUNT_POINT = "/libarchivejs";
 // peak heap use regardless of how large the entry is.
 const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
 
+const ARCHIVE_OK = 0;
+const ARCHIVE_EOF = 1;
+const ARCHIVE_WARN = -20;
+
 // WORKERFS reads Blob slices synchronously via FileReaderSync, which only exists
 // inside a worker. Everywhere else (node, or a wasm build without the FS shipped)
 // we fall back to loading the archive into the heap as before.
@@ -108,13 +112,20 @@ export class ArchiveReader {
    */
   hasEncryptedData() {
     const archive = this._openArchive();
-    this._runCode.getNextEntry(archive);
+    let headerError = null;
+    try {
+      this._nextEntry(archive);
+    } catch (error) {
+      headerError = error;
+    }
     const status = this._runCode.hasEncryptedEntries(archive);
     if (status === 0) {
+      if (headerError !== null) throw headerError;
       return false;
     } else if (status > 0) {
       return true;
     } else {
+      if (headerError !== null) throw headerError;
       return null;
     }
   }
@@ -144,7 +155,7 @@ export class ArchiveReader {
     const archive = this._openArchive();
     let entry;
     while (true) {
-      entry = this._runCode.getNextEntry(archive);
+      entry = this._nextEntry(archive);
       if (entry === 0) break;
 
       const entryData = this._entryData(entry);
@@ -172,7 +183,7 @@ export class ArchiveReader {
 
     let meta = null;
     let entry;
-    while ((entry = this._runCode.getNextEntry(archive)) !== 0) {
+    while ((entry = this._nextEntry(archive)) !== 0) {
       const path = this._runCode.getEntryName(entry);
       if (path !== target) {
         this._runCode.skipEntry(archive);
@@ -228,6 +239,30 @@ export class ArchiveReader {
     }
 
     return entryData;
+  }
+
+  _nextEntry(archive) {
+    const entryOut = this._runCode.malloc(this._runCode.sizeOfSizeT());
+    if (entryOut === 0) {
+      throw new Error("Failed to allocate archive entry pointer");
+    }
+    try {
+      const status = this._runCode.readNextEntry(archive, entryOut);
+      const entry = this._wasmModule.HEAPU32[entryOut >>> 2];
+
+      if (status === ARCHIVE_OK || (status === ARCHIVE_WARN && entry !== 0)) {
+        return entry;
+      }
+      if (status === ARCHIVE_EOF) {
+        return 0;
+      }
+      throw new Error(
+        this._runCode.getError(archive) ||
+          `Error reading archive header (${status})`,
+      );
+    } finally {
+      this._runCode.free(entryOut);
+    }
   }
 
   // Reads an entry in full, a chunk at a time. Chunking matters for more than
@@ -311,7 +346,11 @@ export class ArchiveReader {
     }
     const name = mountName(file);
     // `blobs` rather than `files` so a plain Blob (no name) works too.
-    FS.mount(this._wasmModule.WORKERFS, { blobs: [{ name, data: file }] }, MOUNT_POINT);
+    FS.mount(
+      this._wasmModule.WORKERFS,
+      { blobs: [{ name, data: file }] },
+      MOUNT_POINT,
+    );
     return `${MOUNT_POINT}/${name}`;
   }
 

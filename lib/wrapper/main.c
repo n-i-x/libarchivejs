@@ -80,9 +80,15 @@ double get_entry_size(void *entry){
 }
 
 EMSCRIPTEN_KEEPALIVE
+int read_next_entry(void *archive, void **entry){
+  *entry = NULL;
+  return archive_read_next_header(archive, (struct archive_entry **)entry);
+}
+
+EMSCRIPTEN_KEEPALIVE
 const void *get_next_entry(void *archive){
-  struct archive_entry *entry;
-  if (archive_read_next_header(archive, &entry) == ARCHIVE_OK)
+  void *entry;
+  if (read_next_entry(archive, &entry) == ARCHIVE_OK)
   {
     return entry;
   }

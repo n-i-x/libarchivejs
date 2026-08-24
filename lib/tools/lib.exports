@@ -3,6 +3,7 @@
     "_archive_open",
     "_archive_open_file",
     "_get_next_entry",
+    "_read_next_entry",
     "_get_entry_size",
     "_get_filedata",
     "_read_data_chunk",
