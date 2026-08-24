@@ -5,7 +5,7 @@ import {
 } from "../dist/libarchive-node.mjs";
 import fs from "fs";
 import { Blob } from "buffer";
-import { fileChecksums } from "./checksum-utils";
+import { fileChecksums, getChecksum } from "./checksum-utils";
 import { checksum } from "./checksum";
 
 describe("Extract file using nodejs", () => {
@@ -20,6 +20,63 @@ describe("Extract file using nodejs", () => {
     expect(checksumObj).toEqual(checksum);
     archive.close();
   }, 5000);
+
+  test("Extract password-protected RAR5 compressed data", async () => {
+    const buffer = fs.readFileSync(
+      "test/files/archives/rar/encrypted-v5-compressed.rar",
+    );
+    const archive = await Archive.open(new Blob([buffer]));
+
+    await archive.usePassword("secret");
+    const checksumObj = await fileChecksums(await archive.extractFiles());
+
+    expect(checksumObj).toEqual({
+      "libarchive.wasm":
+        "8a335241c13de819f3d6d77bc87212e9b14f9300334dfbb604a6c057924525d6",
+      "readme.md": checksum["README.md"],
+    });
+    await archive.close();
+  }, 30000);
+
+  test("Extract password-protected RAR5 stored data", async () => {
+    const buffer = fs.readFileSync(
+      "test/files/archives/rar/encrypted-v5-stored.rar",
+    );
+    const archive = await Archive.open(new Blob([buffer]));
+
+    await archive.usePassword("secret");
+    const checksumObj = await fileChecksums(await archive.extractFiles());
+
+    expect(checksumObj["README.md"]).toEqual(checksum["README.md"]);
+    await archive.close();
+  }, 30000);
+
+  test("Reject an incorrect RAR5 password", async () => {
+    const buffer = fs.readFileSync(
+      "test/files/archives/rar/encrypted-v5-stored.rar",
+    );
+    const archive = await Archive.open(new Blob([buffer]));
+
+    await archive.usePassword("wrong");
+    await expect(archive.extractFiles()).rejects.toThrow(/checksum/i);
+    await archive.close();
+  }, 30000);
+
+  test("Extract a selected file from a password-protected solid RAR5", async () => {
+    const buffer = fs.readFileSync(
+      "test/files/archives/rar/encrypted-v5-solid.rar",
+    );
+    const archive = await Archive.open(new Blob([buffer]));
+
+    await archive.usePassword("secret");
+    const file = await archive.extractSingleFile("second.wasm");
+
+    expect(file.size).toBe(1040104);
+    expect(await getChecksum(file)).toBe(
+      "4f24a557658b9c01d77b927364382721944999fc46d1387cd49438dd4e158a8a",
+    );
+    await archive.close();
+  }, 30000);
 
   test("Create new archive", async () => {
     let buffer = fs.readFileSync("test/files/archives/README.md");

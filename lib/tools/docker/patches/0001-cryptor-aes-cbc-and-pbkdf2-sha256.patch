@@ -1,0 +1,220 @@
+diff --git a/libarchive/archive_cryptor.c b/libarchive/archive_cryptor.c
+index 85b20ac..100e275 100644
+--- a/libarchive/archive_cryptor.c
++++ b/libarchive/archive_cryptor.c
+@@ -522,6 +522,150 @@ aes_ctr_update(archive_crypto_ctx *ctx, const uint8_t * const in,
+ #endif /* ARCHIVE_CRYPTOR_STUB */
+ 
+ 
++/*
++ * rar decryption primitives (VPX fork): PBKDF2-HMAC-SHA256 and AES-CBC decrypt.
++ *
++ * Implemented for OpenSSL only, which is what every build that needs them uses
++ * (including the wasm build). The include is repeated here rather than relied
++ * on from archive_cryptor_private.h, because that header picks ONE backend from
++ * a chain of #elifs — on a platform where CommonCrypto or mbedTLS wins, OpenSSL
++ * headers are never pulled in even though libcrypto is linked and usable.
++ */
++#if defined(HAVE_LIBCRYPTO)
++#include <limits.h>
++#include <openssl/evp.h>
++#include <openssl/hmac.h>
++
++static int
++pbkdf2_sha256(const char *pw, size_t pw_len, const uint8_t *salt,
++    size_t salt_len, unsigned rounds, uint8_t *derived_key,
++    size_t derived_key_len)
++{
++	if (PKCS5_PBKDF2_HMAC(pw, (int)pw_len, salt, (int)salt_len,
++	    (int)rounds, EVP_sha256(), (int)derived_key_len, derived_key) != 1)
++		return -1;
++	return 0;
++}
++
++static int
++hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data,
++    size_t data_len, uint8_t *out)
++{
++	unsigned int out_len = 0;
++
++	if (key_len > INT_MAX ||
++	    HMAC(EVP_sha256(), key, (int)key_len, data, data_len, out,
++		&out_len) == NULL || out_len != 32)
++		return -1;
++	return 0;
++}
++
++static int
++aes_cbc_decrypt_init(archive_cbc_ctx *ctx, const uint8_t *key, size_t key_len,
++    const uint8_t *iv)
++{
++	const EVP_CIPHER *type;
++	EVP_CIPHER_CTX *evp;
++
++	switch (key_len) {
++	case 16: type = EVP_aes_128_cbc(); break;
++	case 32: type = EVP_aes_256_cbc(); break;
++	default: *ctx = NULL; return -1;
++	}
++	if ((evp = EVP_CIPHER_CTX_new()) == NULL) {
++		*ctx = NULL;
++		return -1;
++	}
++	if (EVP_DecryptInit_ex(evp, type, NULL, key, iv) != 1) {
++		EVP_CIPHER_CTX_free(evp);
++		*ctx = NULL;
++		return -1;
++	}
++	/* rar pads its encrypted data out to the block size itself and tracks
++	 * the real length separately, so EVP must not try to strip PKCS#7
++	 * padding that was never added. */
++	EVP_CIPHER_CTX_set_padding(evp, 0);
++	*ctx = evp;
++	return 0;
++}
++
++static int
++aes_cbc_decrypt_update(archive_cbc_ctx *ctx, const uint8_t *in, size_t in_len,
++    uint8_t *out, size_t *out_len)
++{
++	EVP_CIPHER_CTX *evp = (EVP_CIPHER_CTX *)*ctx;
++	int olen;
++
++	if (evp == NULL)
++		return -1;
++	/* CBC only makes sense a whole block at a time; a caller handing over a
++	 * partial block has miscounted the encrypted region. */
++	if (in_len == 0 || (in_len % AES_BLOCK_SIZE) != 0 || *out_len < in_len)
++		return -1;
++	olen = (int)*out_len;
++	if (EVP_DecryptUpdate(evp, out, &olen, in, (int)in_len) != 1)
++		return -1;
++	*out_len = (size_t)olen;
++	return 0;
++}
++
++static int
++aes_cbc_decrypt_release(archive_cbc_ctx *ctx)
++{
++	if (*ctx != NULL) {
++		EVP_CIPHER_CTX_free((EVP_CIPHER_CTX *)*ctx);
++		*ctx = NULL;
++	}
++	return 0;
++}
++
++#else
++
++static int
++pbkdf2_sha256(const char *pw, size_t pw_len, const uint8_t *salt,
++    size_t salt_len, unsigned rounds, uint8_t *derived_key,
++    size_t derived_key_len)
++{
++	(void)pw; (void)pw_len; (void)salt; (void)salt_len; (void)rounds;
++	(void)derived_key; (void)derived_key_len;
++	return CRYPTOR_STUB_FUNCTION;
++}
++
++static int
++hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data,
++    size_t data_len, uint8_t *out)
++{
++	(void)key; (void)key_len; (void)data; (void)data_len; (void)out;
++	return CRYPTOR_STUB_FUNCTION;
++}
++
++static int
++aes_cbc_decrypt_init(archive_cbc_ctx *ctx, const uint8_t *key, size_t key_len,
++    const uint8_t *iv)
++{
++	(void)key; (void)key_len; (void)iv;
++	*ctx = NULL;
++	return CRYPTOR_STUB_FUNCTION;
++}
++
++static int
++aes_cbc_decrypt_update(archive_cbc_ctx *ctx, const uint8_t *in, size_t in_len,
++    uint8_t *out, size_t *out_len)
++{
++	(void)ctx; (void)in; (void)in_len; (void)out;
++	*out_len = 0;
++	return CRYPTOR_STUB_FUNCTION;
++}
++
++static int
++aes_cbc_decrypt_release(archive_cbc_ctx *ctx)
++{
++	*ctx = NULL;
++	return CRYPTOR_STUB_FUNCTION;
++}
++
++#endif
++
+ const struct archive_cryptor __archive_cryptor =
+ {
+   &pbkdf2_sha1,
+@@ -531,4 +675,9 @@ const struct archive_cryptor __archive_cryptor =
+   &aes_ctr_init,
+   &aes_ctr_update,
+   &aes_ctr_release,
++  &pbkdf2_sha256,
++  &hmac_sha256,
++  &aes_cbc_decrypt_init,
++  &aes_cbc_decrypt_update,
++  &aes_cbc_decrypt_release,
+ };
+diff --git a/libarchive/archive_cryptor_private.h b/libarchive/archive_cryptor_private.h
+index 069eccd..347821b 100644
+--- a/libarchive/archive_cryptor_private.h
++++ b/libarchive/archive_cryptor_private.h
+@@ -172,6 +172,31 @@ typedef int archive_crypto_ctx;
+ #define archive_encrypto_aes_ctr_release(ctx) \
+   __archive_cryptor.encrypto_aes_ctr_release(ctx)
+ 
++/*
++ * rar decryption support (VPX fork).
++ *
++ * The rar readers need AES in CBC mode and a SHA-256 based KDF, neither of
++ * which upstream libarchive has: the cryptor only ever needed CTR mode and
++ * PBKDF2-HMAC-SHA1 for zip. The CBC context is deliberately opaque (a void *
++ * allocated by the backend) so this needs no per-backend struct in the chain of
++ * #elifs above — only OpenSSL implements it, and every other backend refuses
++ * with CRYPTOR_STUB_FUNCTION, exactly as an unsupported format does today.
++ */
++typedef void *archive_cbc_ctx;
++
++#define archive_pbkdf2_sha256(pw, pw_len, salt, salt_len, rounds, dk, dk_len)\
++  __archive_cryptor.pbkdf2sha256(pw, pw_len, salt, salt_len, rounds, dk, dk_len)
++
++#define archive_hmac_sha256(key, key_len, data, data_len, out) \
++  __archive_cryptor.hmacsha256(key, key_len, data, data_len, out)
++
++#define archive_decrypto_aes_cbc_init(ctx, key, key_len, iv) \
++  __archive_cryptor.decrypto_aes_cbc_init(ctx, key, key_len, iv)
++#define archive_decrypto_aes_cbc_update(ctx, in, in_len, out, out_len) \
++  __archive_cryptor.decrypto_aes_cbc_update(ctx, in, in_len, out, out_len)
++#define archive_decrypto_aes_cbc_release(ctx) \
++  __archive_cryptor.decrypto_aes_cbc_release(ctx)
++
+ /* Stub return value if no encryption support exists. */
+ #define CRYPTOR_STUB_FUNCTION	-2
+ 
+@@ -192,6 +217,18 @@ struct archive_cryptor
+   int (*encrypto_aes_ctr_update)(archive_crypto_ctx *, const uint8_t *,
+     size_t, uint8_t *, size_t *);
+   int (*encrypto_aes_ctr_release)(archive_crypto_ctx *);
++  /* PKCS5 PBKDF2 HMAC-SHA256 (rar5 key derivation) */
++  int (*pbkdf2sha256)(const char *pw, size_t pw_len, const uint8_t *salt,
++    size_t salt_len, unsigned rounds, uint8_t *derived_key,
++    size_t derived_key_len);
++  int (*hmacsha256)(const uint8_t *key, size_t key_len,
++    const uint8_t *data, size_t data_len, uint8_t *out);
++  /* AES CBC mode, decryption only (rar4 and rar5 entry data and headers) */
++  int (*decrypto_aes_cbc_init)(archive_cbc_ctx *, const uint8_t *, size_t,
++    const uint8_t *);
++  int (*decrypto_aes_cbc_update)(archive_cbc_ctx *, const uint8_t *,
++    size_t, uint8_t *, size_t *);
++  int (*decrypto_aes_cbc_release)(archive_cbc_ctx *);
+ };
+ 
+ extern const struct archive_cryptor __archive_cryptor;

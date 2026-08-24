@@ -1,0 +1,691 @@
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -388,6 +388,42 @@
+ 		size_t buf_len;   /* decrypted bytes, padding excluded */
+ 		size_t buf_pos;   /* read cursor while serving */
+ 	} hdrcrypt;
++
++	/*
++	 * State for decrypting one entry's packed data. Unlike a header this
++	 * cannot be decrypted in one go -- an entry is far too big to hold in
++	 * memory -- so a sliding window is refilled from the stream as the
++	 * decompressor asks for bytes. The compressed block headers RAR5 puts
++	 * inside the packed stream are covered by this too, because they are
++	 * part of the encrypted region.
++	 */
++	struct {
++		int have_record;  /* EX_CRYPT seen while parsing this header */
++		int active;       /* this entry's data is encrypted */
++		int last_block_seen;  /* final compressed block reached */
++		int ctx_valid;
++		unsigned kdf_count;
++		int use_hash_mac;
++		uint8_t salt[16];
++		uint8_t iv[16];
++		uint8_t key[32];
++		uint8_t hash_key[32];
++		archive_cbc_ctx ctx;
++		uint8_t *buf;
++		size_t buf_cap;
++		size_t buf_len;
++		size_t buf_pos;
++		int64_t enc_remaining;  /* ciphertext left in this entry */
++		/* Deriving a key costs tens of thousands of PBKDF2 rounds, and
++		 * every entry in an archive normally shares one salt, so the
++		 * last result is kept and reused. */
++		uint8_t cached_salt[16];
++		unsigned cached_kdf;
++		uint8_t cached_key[32];
++		uint8_t cached_hash_key[32];
++		int cached_valid;
++		int cached_hash_key_valid;
++	} datacrypt;
+ };
+ 
+ /* Forward function declarations. */
+@@ -927,6 +963,7 @@
+  * service. Real archives use 15 (32768 iterations). */
+ #define RAR5_MAX_KDF_SHIFT 24
+ #define RAR5_CRYPT_BLOCK   16
++#define RAR5_DATA_SLACK     8
+ /*
+  * Zero padding kept past the end of a decrypted header. read_var() asks for 10
+  * bytes to decode a value that is often a single byte, which the stream always
+@@ -945,6 +982,12 @@
+  */
+ #define RAR5_MAX_PASSPHRASE_TRIES 100
+ 
++static int rar5_datacrypt_fill(struct archive_read* a, struct rar5* rar5,
++    size_t need);
++static int rar5_datacrypt_key(struct archive_read* a, struct rar5* rar5);
++static void rar5_datacrypt_end(struct rar5* rar5);
++static int rar5_datacrypt_finish(struct archive_read* a, struct rar5* rar5);
++
+ static int read_ahead(struct archive_read* a, size_t how_many,
+     const uint8_t** ptr)
+ {
+@@ -963,6 +1006,15 @@
+ 		return 1;
+ 	}
+ 
++	/* Serving an encrypted entry's data: top the window up and hand back a
++	 * pointer into it. */
++	if(rar5 != NULL && rar5->datacrypt.active) {
++		if(rar5_datacrypt_fill(a, rar5, how_many) != ARCHIVE_OK)
++			return 0;
++		*ptr = rar5->datacrypt.buf + rar5->datacrypt.buf_pos;
++		return 1;
++	}
++
+ 	*ptr = __archive_read_ahead(a, how_many, NULL);
+ 	if(*ptr == NULL) {
+ 		return 0;
+@@ -983,6 +1035,14 @@
+ 		return ARCHIVE_OK;
+ 	}
+ 
++	if(rar5 != NULL && rar5->datacrypt.active) {
++		if(how_many < 0 || rar5->datacrypt.buf_pos + (size_t)how_many >
++		    rar5->datacrypt.buf_len)
++			return ARCHIVE_FATAL;
++		rar5->datacrypt.buf_pos += (size_t)how_many;
++		return ARCHIVE_OK;
++	}
++
+ 	ret = how_many == __archive_read_consume(a, how_many)
+ 		? ARCHIVE_OK
+ 		: ARCHIVE_FATAL;
+@@ -1564,6 +1624,74 @@
+ 	return ARCHIVE_OK;
+ }
+ 
++/*
++ * The per-entry encryption record: which cipher, the KDF iteration count and
++ * salt used to derive this entry's key, the IV its CBC chain starts from, and
++ * optionally a value that tells a wrong passphrase from a right one.
++ *
++ * Only AES-256 (algorithm 0) exists in RAR5 today; anything else is refused
++ * rather than guessed at.
++ */
++static int parse_file_extra_crypt(struct archive_read* a,
++    struct archive_entry* e, struct rar5* rar5, int64_t* extra_data_size,
++    uint64_t extra_field_size)
++{
++	size_t algo = 0, enc_flags = 0;
++	size_t var_size;
++	uint64_t used = 0;
++	const uint8_t* p;
++
++	archive_entry_set_is_data_encrypted(e, 1);
++	rar5->has_encrypted_entries = 1;
++	rar5->cstate.data_encrypted = 1;
++
++	if(!read_var_sized(a, &algo, &var_size))
++		return ARCHIVE_EOF;
++	*extra_data_size -= var_size;
++	used += var_size;
++	if(ARCHIVE_OK != consume(a, var_size))
++		return ARCHIVE_EOF;
++
++	if(!read_var_sized(a, &enc_flags, &var_size))
++		return ARCHIVE_EOF;
++	*extra_data_size -= var_size;
++	used += var_size;
++	if(ARCHIVE_OK != consume(a, var_size))
++		return ARCHIVE_EOF;
++
++	if(algo != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Unsupported RAR5 encryption algorithm (0x%jx)",
++		    (uintmax_t)algo);
++		return ARCHIVE_FATAL;
++	}
++	rar5->datacrypt.use_hash_mac = (enc_flags & 0x02) != 0;
++
++	/* KDF count, salt and IV are a fixed 33 byte run. */
++	if(!read_ahead(a, 33, &p))
++		return ARCHIVE_EOF;
++	rar5->datacrypt.kdf_count = p[0];
++	memcpy(rar5->datacrypt.salt, p + 1, sizeof(rar5->datacrypt.salt));
++	memcpy(rar5->datacrypt.iv, p + 17, sizeof(rar5->datacrypt.iv));
++	if(ARCHIVE_OK != consume(a, 33))
++		return ARCHIVE_EOF;
++	*extra_data_size -= 33;
++	used += 33;
++
++	/* Whatever is left of the record (the password check value, or a field
++	 * from a newer RAR than this understands) is not needed to decrypt. */
++	if(used < extra_field_size) {
++		uint64_t rest = extra_field_size - used;
++
++		*extra_data_size -= rest;
++		if(ARCHIVE_OK != consume(a, (int64_t)rest))
++			return ARCHIVE_EOF;
++	}
++
++	rar5->datacrypt.have_record = 1;
++	return ARCHIVE_OK;
++}
++
+ static int parse_htime_item(struct archive_read* a, char unix_time,
+     int64_t* sec, uint32_t* nsec, int64_t* extra_data_size)
+ {
+@@ -1925,11 +2053,9 @@
+ 				    &extra_data_size);
+ 				break;
+ 			case EX_CRYPT:
+-				/* Mark the entry as encrypted */
+-				archive_entry_set_is_data_encrypted(e, 1);
+-				rar5->has_encrypted_entries = 1;
+-				rar5->cstate.data_encrypted = 1;
+-				/* fallthrough */
++				ret = parse_file_extra_crypt(a, e, rar5,
++				    &extra_data_size, extra_field_size);
++				break;
+ 			case EX_SUBDATA:
+ 				/* fallthrough */
+ 			default:
+@@ -2305,6 +2431,24 @@
+ 		rar5->cstate.initialized = 0;
+ 	}
+ 
++	/* The header is parsed, so the entry's encryption record (if any) has
++	 * been seen and its packed size is known: arm decryption for the data
++	 * that follows. RAR5 pads the encrypted region out to a cipher block,
++	 * and the packed size covers that padding, so it is exactly the amount
++	 * of ciphertext to expect. */
++	if(rar5->datacrypt.have_record) {
++		int cret = rar5_datacrypt_key(a, rar5);
++
++		if(cret != ARCHIVE_OK)
++			return cret;
++
++		rar5->datacrypt.enc_remaining = rar5->file.bytes_remaining;
++		rar5->datacrypt.buf_len = 0;
++		rar5->datacrypt.buf_pos = 0;
++		rar5->datacrypt.last_block_seen = 0;
++		rar5->datacrypt.active = 1;
++	}
++
+ 	if(rar5->generic.split_before > 0) {
+ 		/* If now we're standing on a header that has a 'split before'
+ 		 * mark, it means we're standing on a 'continuation' file
+@@ -2528,6 +2672,267 @@
+  * <FILE> block.
+  */
+ 
++/* Default size of the sliding window used to decrypt an entry's packed data. */
++#define RAR5_DATA_WINDOW (64 * 1024)
++
++/*
++ * Derive the key for an entry's data, reusing the last one when the salt and
++ * iteration count match -- which they normally do for every entry in an
++ * archive, and each derivation is tens of thousands of PBKDF2 rounds.
++ */
++static int
++rar5_datacrypt_key(struct archive_read* a, struct rar5* rar5)
++{
++	const char* pw = NULL;
++	int cache_match;
++	int ret;
++
++	cache_match = rar5->datacrypt.cached_valid &&
++	    rar5->datacrypt.cached_kdf == rar5->datacrypt.kdf_count &&
++	    memcmp(rar5->datacrypt.cached_salt, rar5->datacrypt.salt,
++		sizeof(rar5->datacrypt.salt)) == 0;
++	if(cache_match) {
++		memcpy(rar5->datacrypt.key, rar5->datacrypt.cached_key,
++		    sizeof(rar5->datacrypt.key));
++	}
++
++	if(rar5->datacrypt.kdf_count > RAR5_MAX_KDF_SHIFT) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Unsupported RAR5 KDF count");
++		return ARCHIVE_FATAL;
++	}
++
++	/* An archive with encrypted headers already holds a verified key, and
++	 * the entries share its salt, so nothing needs to be asked for again. */
++	if(!cache_match && rar5->hdrcrypt.enabled &&
++	    rar5->hdrcrypt.kdf_count == rar5->datacrypt.kdf_count &&
++	    memcmp(rar5->hdrcrypt.salt, rar5->datacrypt.salt,
++		sizeof(rar5->datacrypt.salt)) == 0) {
++		memcpy(rar5->datacrypt.key, rar5->hdrcrypt.key,
++		    sizeof(rar5->datacrypt.key));
++	} else if(!cache_match) {
++		__archive_read_reset_passphrase(a);
++		pw = __archive_read_next_passphrase(a);
++		if(pw == NULL || pw[0] == '\0') {
++			archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++			    "Passphrase required for this entry");
++			return ARCHIVE_FATAL;
++		}
++
++		ret = archive_pbkdf2_sha256(pw, strlen(pw),
++		    rar5->datacrypt.salt, sizeof(rar5->datacrypt.salt),
++		    1U << rar5->datacrypt.kdf_count, rar5->datacrypt.key,
++		    sizeof(rar5->datacrypt.key));
++		if(ret != 0) {
++			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++			    ret == CRYPTOR_STUB_FUNCTION
++				? "Decryption is unsupported due to lack of crypto library"
++				: "Failed to derive the entry key");
++			return ARCHIVE_FATAL;
++		}
++	}
++
++	/* RAR's HASHMAC flag replaces a plain file checksum with an HMAC
++	 * keyed by the PBKDF2 value at iteration count + 16. */
++	if(rar5->datacrypt.use_hash_mac) {
++		if(cache_match && rar5->datacrypt.cached_hash_key_valid) {
++			memcpy(rar5->datacrypt.hash_key,
++			    rar5->datacrypt.cached_hash_key,
++			    sizeof(rar5->datacrypt.hash_key));
++		} else {
++			if(pw == NULL) {
++				__archive_read_reset_passphrase(a);
++				pw = __archive_read_next_passphrase(a);
++			}
++			if(pw == NULL || pw[0] == '\0') {
++				archive_set_error(&a->archive,
++				    ARCHIVE_ERRNO_FILE_FORMAT,
++				    "Passphrase required for this entry");
++				return ARCHIVE_FATAL;
++			}
++
++			ret = archive_pbkdf2_sha256(pw, strlen(pw),
++			    rar5->datacrypt.salt,
++			    sizeof(rar5->datacrypt.salt),
++			    (1U << rar5->datacrypt.kdf_count) + 16,
++			    rar5->datacrypt.hash_key,
++			    sizeof(rar5->datacrypt.hash_key));
++			if(ret != 0) {
++				archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++				    "Failed to derive the entry checksum key");
++				return ARCHIVE_FATAL;
++			}
++		}
++	}
++
++	if(!cache_match)
++		rar5->datacrypt.cached_hash_key_valid = 0;
++	memcpy(rar5->datacrypt.cached_salt, rar5->datacrypt.salt,
++	    sizeof(rar5->datacrypt.salt));
++	memcpy(rar5->datacrypt.cached_key, rar5->datacrypt.key,
++	    sizeof(rar5->datacrypt.key));
++	rar5->datacrypt.cached_kdf = rar5->datacrypt.kdf_count;
++	rar5->datacrypt.cached_valid = 1;
++	if(rar5->datacrypt.use_hash_mac) {
++		memcpy(rar5->datacrypt.cached_hash_key,
++		    rar5->datacrypt.hash_key,
++		    sizeof(rar5->datacrypt.hash_key));
++		rar5->datacrypt.cached_hash_key_valid = 1;
++	}
++
++	return ARCHIVE_OK;
++}
++
++/*
++ * End an entry and leave the read stream where the next header begins.
++ *
++ * The sliding window reads ahead, so when an entry is done -- extracted or
++ * skipped -- some of its ciphertext is usually still sitting unread in the
++ * stream. bytes_remaining cannot be used to skip it, because that counts
++ * decrypted bytes still owed to the consumer, and the two have drifted apart by
++ * whatever the window buffered. enc_remaining is the authoritative count of
++ * what is genuinely left.
++ */
++static int
++rar5_datacrypt_finish(struct archive_read* a, struct rar5* rar5)
++{
++	int64_t rest;
++
++	if(!rar5->datacrypt.active)
++		return ARCHIVE_OK;
++	rest = rar5->datacrypt.enc_remaining;
++	rar5_datacrypt_end(rar5);
++	rar5->file.bytes_remaining = 0;
++
++	if(rest > 0 && rest != __archive_read_consume(a, rest))
++		return ARCHIVE_FATAL;
++
++	return ARCHIVE_OK;
++}
++
++/* Drop the cipher state at the end of an entry. Each entry starts a fresh CBC
++ * chain from its own IV, so this must not leak across entries. */
++static void
++rar5_datacrypt_end(struct rar5* rar5)
++{
++	if(rar5->datacrypt.ctx_valid) {
++		archive_decrypto_aes_cbc_release(&rar5->datacrypt.ctx);
++		rar5->datacrypt.ctx_valid = 0;
++	}
++	rar5->datacrypt.active = 0;
++	rar5->datacrypt.last_block_seen = 0;
++	rar5->datacrypt.buf_len = 0;
++	rar5->datacrypt.buf_pos = 0;
++	rar5->datacrypt.enc_remaining = 0;
++}
++
++/*
++ * Make at least `need` decrypted bytes available at buf_pos, pulling more
++ * ciphertext off the stream and decrypting it as required.
++ *
++ * The stream is read through __archive_read_ahead/consume directly rather than
++ * the wrappers, which at this point are redirected right back here.
++ */
++static int
++rar5_datacrypt_fill(struct archive_read* a, struct rar5* rar5, size_t need)
++{
++	size_t avail = rar5->datacrypt.buf_len - rar5->datacrypt.buf_pos;
++
++	if(avail >= need)
++		return ARCHIVE_OK;
++
++	if(!rar5->datacrypt.ctx_valid) {
++		if(archive_decrypto_aes_cbc_init(&rar5->datacrypt.ctx,
++		    rar5->datacrypt.key, sizeof(rar5->datacrypt.key),
++		    rar5->datacrypt.iv) != 0) {
++			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++			    "Failed to initialize entry decryption");
++			return ARCHIVE_FATAL;
++		}
++		rar5->datacrypt.ctx_valid = 1;
++	}
++
++	/* Move what is left to the front so the window can be refilled. */
++	if(rar5->datacrypt.buf_pos > 0) {
++		memmove(rar5->datacrypt.buf,
++		    rar5->datacrypt.buf + rar5->datacrypt.buf_pos, avail);
++		rar5->datacrypt.buf_len = avail;
++		rar5->datacrypt.buf_pos = 0;
++	}
++
++	/* Keep enough room for the retained prefix and a whole number of new
++	 * cipher blocks. Rounding `need` alone is not sufficient when `avail`
++	 * is not block-aligned: it can leave fewer than `need` bytes available
++	 * while also leaving too little free space to decrypt one more block. */
++	if(avail < need) {
++		size_t missing = need - avail;
++		size_t min_cap = avail + ((missing + RAR5_CRYPT_BLOCK - 1) /
++		    RAR5_CRYPT_BLOCK) * RAR5_CRYPT_BLOCK;
++		size_t cap = min_cap < RAR5_DATA_WINDOW
++		    ? RAR5_DATA_WINDOW : min_cap;
++		if(rar5->datacrypt.buf_cap < min_cap) {
++			uint8_t* nb = realloc(rar5->datacrypt.buf, cap);
++
++			if(nb == NULL) {
++				archive_set_error(&a->archive, ENOMEM,
++				    "Cannot allocate memory for decrypted data");
++				return ARCHIVE_FATAL;
++			}
++			rar5->datacrypt.buf = nb;
++			rar5->datacrypt.buf_cap = cap;
++		}
++	}
++
++	while(rar5->datacrypt.buf_len < need) {
++		const uint8_t* p;
++		size_t want = rar5->datacrypt.buf_cap - rar5->datacrypt.buf_len;
++		size_t out_len;
++
++		if((int64_t)want > rar5->datacrypt.enc_remaining)
++			want = (size_t)rar5->datacrypt.enc_remaining;
++		/* CBC only advances a whole block at a time. */
++		want -= want % RAR5_CRYPT_BLOCK;
++		if(want == 0) {
++			/* The compressed bit reader deliberately looks a few bytes
++			 * beyond the end of a block. Unencrypted input gets this tail
++			 * from archive_read_ahead(), while an encrypted entry ends at
++			 * its AES padding. Provide a zeroed, non-consumable tail for
++			 * that look-ahead. consume() still checks buf_len, so malformed
++			 * input cannot consume these synthetic bytes. */
++			if(rar5->datacrypt.enc_remaining == 0 &&
++			    need <= rar5->datacrypt.buf_len + RAR5_DATA_SLACK) {
++				memset(rar5->datacrypt.buf + rar5->datacrypt.buf_len,
++				    0, need - rar5->datacrypt.buf_len);
++				return ARCHIVE_OK;
++			}
++			archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++			    "Truncated encrypted data");
++			return ARCHIVE_FATAL;
++		}
++
++		p = __archive_read_ahead(a, want, NULL);
++		if(p == NULL)
++			return ARCHIVE_FATAL;
++
++		out_len = want;
++		if(archive_decrypto_aes_cbc_update(&rar5->datacrypt.ctx, p,
++		    want, rar5->datacrypt.buf + rar5->datacrypt.buf_len,
++		    &out_len) != 0 || out_len != want) {
++			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++			    "Failed to decrypt entry data");
++			return ARCHIVE_FATAL;
++		}
++
++		if(want != (size_t)__archive_read_consume(a, (int64_t)want))
++			return ARCHIVE_FATAL;
++
++		rar5->datacrypt.buf_len += want;
++		rar5->datacrypt.enc_remaining -= want;
++	}
++
++	return ARCHIVE_OK;
++}
++
+ /*
+  * HEAD_CRYPT describes how the rest of the archive is encrypted. It is itself
+  * in the clear -- it has to be, since it carries the salt needed to derive the
+@@ -2640,6 +3045,15 @@
+ 	struct rar5* rar5 = a->format->data;
+ 	int ret;
+ 
++	/* Drop the previous entry's cipher state first: it must not still be
++	 * intercepting reads while the leftovers below are skipped, and each
++	 * entry starts a fresh CBC chain from its own IV anyway. */
++	ret = rar5_datacrypt_finish(a, rar5);
++	if(ret != ARCHIVE_OK)
++		return ret;
++	rar5->datacrypt.have_record = 0;
++	rar5->datacrypt.use_hash_mac = 0;
++
+ 	/* Leftover data bytes from the previous entry live in the real stream,
+ 	 * so this has to happen before the redirect is armed. */
+ 	ret = skip_unprocessed_bytes(a);
+@@ -4066,6 +4480,9 @@
+ 			return ret;
+ 		}
+ 
++		if(bf_is_last_block(&rar5->last_block_hdr))
++			rar5->datacrypt.last_block_seen = 1;
++
+ 		/* Skip block header. Next data is huffman tables,
+ 		 * if present. */
+ 		to_skip = sizeof(struct compressed_block_header) +
+@@ -4457,6 +4874,14 @@
+ 	}
+ 
+ 	to_read = rar5_min(rar5->file.bytes_remaining, 64 * 1024);
++	if(rar5->datacrypt.active) {
++		int64_t plain_remaining = rar5->file.unpacked_size -
++		    rar5->cstate.last_unstore_ptr;
++
++		if(plain_remaining < 0)
++			plain_remaining = 0;
++		to_read = rar5_min(to_read, plain_remaining);
++	}
+ 	if(to_read == 0) {
+ 		return ARCHIVE_EOF;
+ 	}
+@@ -4530,6 +4955,23 @@
+ #endif
+ }
+ 
++static int
++rar5_mac_checksum(struct archive_read* a, struct rar5* rar5,
++    const uint8_t* value, size_t value_len, uint8_t digest[32])
++{
++	int ret = archive_hmac_sha256(rar5->datacrypt.hash_key,
++	    sizeof(rar5->datacrypt.hash_key), value, value_len, digest);
++
++	if(ret != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    ret == CRYPTOR_STUB_FUNCTION
++			? "Checksum verification is unsupported due to lack of crypto library"
++			: "Failed to calculate encrypted entry checksum");
++		return ARCHIVE_FATAL;
++	}
++	return ARCHIVE_OK;
++}
++
+ static int verify_checksums(struct archive_read* a) {
+ 	struct rar5 *rar5 = a->format->data;
+ 	int verify_crc;
+@@ -4564,10 +5006,26 @@
+ 		 * checksum (CRC32 or BLAKE2sp) is the same as what is stored
+ 		 * in the archive. */
+ 		if(rar5->file.stored_crc32 > 0) {
++			uint32_t calculated_crc32 = rar5->file.calculated_crc32;
++
++			if(rar5->datacrypt.use_hash_mac) {
++				uint8_t raw_crc[4], digest[32];
++				size_t i;
++
++				archive_le32enc(raw_crc, calculated_crc32);
++				if(rar5_mac_checksum(a, rar5, raw_crc,
++				    sizeof(raw_crc), digest) != ARCHIVE_OK)
++					return ARCHIVE_FATAL;
++
++				calculated_crc32 = 0;
++				for(i = 0; i < sizeof(digest); i++)
++					calculated_crc32 ^= (uint32_t)digest[i]
++					    << ((i & 3) * 8);
++			}
+ 			/* Check CRC32 only when the file contains a CRC32
+ 			 * value for this file. */
+ 
+-			if(rar5->file.calculated_crc32 !=
++			if(calculated_crc32 !=
+ 			    rar5->file.stored_crc32) {
+ 				/* Checksums do not match; the unpacked file
+ 				 * is corrupted. */
+@@ -4612,6 +5070,15 @@
+ 			uint8_t b2_buf[32];
+ 			(void) blake2sp_final(&rar5->file.b2state, b2_buf, 32);
+ 
++			if(rar5->datacrypt.use_hash_mac) {
++				uint8_t digest[32];
++
++				if(rar5_mac_checksum(a, rar5, b2_buf,
++				    sizeof(b2_buf), digest) != ARCHIVE_OK)
++					return ARCHIVE_FATAL;
++				memcpy(b2_buf, digest, sizeof(b2_buf));
++			}
++
+ 			if(memcmp(&rar5->file.blake2sp, b2_buf, 32) != 0) {
+ #ifndef DONT_FAIL_ON_CRC_ERROR
+ 				archive_set_error(&a->archive,
+@@ -4647,6 +5114,8 @@
+ static int rar5_read_data(struct archive_read *a, const void **buff,
+     size_t *size, int64_t *offset) {
+ 	struct rar5 *rar5 = a->format->data;
++	int64_t unpacked_pos;
++	int stored;
+ 	int ret;
+ 
+ 	if (size)
+@@ -4656,7 +5125,17 @@
+ 		rar5->has_encrypted_entries = 0;
+ 	}
+ 
+-	if (rar5->headers_are_encrypted || rar5->cstate.data_encrypted) {
++	/* Encrypted headers and encrypted entry data are both handled now, so
++	 * this only rejects what is still genuinely unreadable: an encrypted
++	 * archive whose key was never established. */
++	/* cstate.data_encrypted is deliberately sticky -- the solid check
++	 * earlier in the header parse relies on it surviving from the previous
++	 * entry -- so it cannot answer "is THIS entry encrypted". have_record
++	 * can: it is cleared for every header and set only by that header's own
++	 * encryption record, which keeps directories and other data-less
++	 * entries in an encrypted archive from being refused here. */
++	if((rar5->headers_are_encrypted && !rar5->hdrcrypt.enabled) ||
++	    (rar5->datacrypt.have_record && !rar5->datacrypt.active)) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Reading encrypted data is not currently supported");
+ 		return ARCHIVE_FAILED;
+@@ -4692,8 +5171,14 @@
+ 		return ret;
+ 	}
+ 
+-	if(rar5->file.bytes_remaining == 0 &&
+-			rar5->cstate.last_write_ptr == rar5->file.unpacked_size)
++	stored = rar5->file.service > 0 || rar5->cstate.method == 0;
++	unpacked_pos = stored ? rar5->cstate.last_unstore_ptr
++	    : rar5->cstate.last_write_ptr;
++	if(unpacked_pos == rar5->file.unpacked_size &&
++	    (rar5->file.bytes_remaining == 0 ||
++	    (rar5->datacrypt.active &&
++	    (stored || (rar5->datacrypt.last_block_seen &&
++	    rar5->cstate.block_parsing_finished)))))
+ 	{
+ 		/* If all bytes of current file were processed, run
+ 		 * finalization.
+@@ -4723,7 +5208,21 @@
+ 	int ret;
+ 
+ 	rar5->hdrcrypt.serving = 0;
++
++	/* A solid archive cannot discard an encrypted entry outright: later
++	 * entries refer back to bytes this entry writes into the shared unpack
++	 * window. Decode it in skip mode below, then discard only its output.
++	 * Non-solid entries can still take the fast path and skip the ciphertext
++	 * that has not already been pulled into the sliding window. */
++	if(rar5->datacrypt.active && !rar5->main.solid) {
++		ret = rar5_datacrypt_finish(a, rar5);
++		rar5->hdrcrypt.serving = serving;
++		return ret;
++	}
++
+ 	ret = rar5_read_data_skip_internal(a);
++	if(ret == ARCHIVE_OK && rar5->datacrypt.active)
++		ret = rar5_datacrypt_finish(a, rar5);
+ 	rar5->hdrcrypt.serving = serving;
+ 
+ 	return ret;
+@@ -4732,19 +5231,18 @@
+ static int rar5_read_data_skip_internal(struct archive_read *a) {
+ 	struct rar5 *rar5 = a->format->data;
+ 
+-	if(rar5->main.solid && (rar5->cstate.data_encrypted == 0)) {
++	if(rar5->main.solid &&
++	    (rar5->cstate.data_encrypted == 0 || rar5->datacrypt.active)) {
+ 		/* In solid archives, instead of skipping the data, we need to
+ 		 * extract it, and dispose the result. The side effect of this
+ 		 * operation will be setting up the initial window buffer state
+-		 * needed to be able to extract the selected file. Note that
+-		 * this is only possible when data within this solid block is
+-		 * not encrypted, in which case we'll skip and fail if the user
+-		 * tries to read data. */
++		 * needed to be able to extract the selected file. Encrypted data
++		 * can take this path only while its decryption window is active. */
+ 
+ 		int ret;
+ 
+ 		/* Make sure to process all blocks in the compressed stream. */
+-		while(rar5->file.bytes_remaining > 0) {
++		while(rar5->file.bytes_remaining > 0 && !rar5->file.eof) {
+ 			/* Setting the "skip mode" will allow us to skip
+ 			 * checksum checks during data skipping. Checking the
+ 			 * checksum of skipped data isn't really necessary and
+@@ -4806,6 +5304,8 @@
+ 
+ 	free(rar5->vol.push_buf);
+ 	free(rar5->hdrcrypt.buf);
++	rar5_datacrypt_end(rar5);
++	free(rar5->datacrypt.buf);
+ 
+ 	free_filters(rar5);
+ 	rar5_deinit(rar5);
+

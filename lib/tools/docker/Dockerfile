@@ -51,11 +51,28 @@ RUN cd /opt/xz-5.2.11 && emconfigure ./configure --disable-assembler --enable-th
 # libarchive is fetched and built last, on its own layers, so bumping it doesn't
 # invalidate the codec builds above — those take the bulk of the build time and
 # never change. Override with: docker build --build-arg LIBARCHIVE_VERSION=x.y.z
-ARG LIBARCHIVE_VERSION=3.7.2
+# 3.8.9 is what the committed wasm is built from (the 3.7.2 default predated that
+# bump), and what patches/ is written against — a mismatch fails at `patch`.
+ARG LIBARCHIVE_VERSION=3.8.9
 ADD https://github.com/libarchive/libarchive/releases/download/v${LIBARCHIVE_VERSION}/libarchive-${LIBARCHIVE_VERSION}.zip /opt
 # -d matters: the working directory here is still the previous build's source
 # tree, and unzip would otherwise extract into it.
 RUN unzip -q /opt/libarchive-${LIBARCHIVE_VERSION}.zip -d /opt && rm /opt/libarchive-${LIBARCHIVE_VERSION}.zip
+
+# Local patches to libarchive, applied before the build. Upstream libarchive has
+# no RAR decryption -- it detects encrypted entries and refuses them -- so this
+# project carries that support here. Keep each patch focused and
+# rebased when LIBARCHIVE_VERSION moves; a patch that no longer applies fails the
+# build loudly rather than silently producing a wasm without the feature.
+#
+# The patches live under the docker build context because COPY cannot reach
+# outside it. Build the image from this directory:
+#   docker build -t libarchive-llvm lib/tools/docker/
+COPY patches/ /opt/patches/
+RUN cd /opt/libarchive-${LIBARCHIVE_VERSION} && \
+    for p in /opt/patches/*.patch; do \
+      echo "applying $(basename "$p")" && patch -p1 --batch --forward < "$p" || exit 1; \
+    done
 
 # Compile libarchive to LLVM
 ENV EMCC_CFLAGS "-s USE_BZIP2=1"

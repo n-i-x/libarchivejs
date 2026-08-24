@@ -1,0 +1,515 @@
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index faddad9..3bd24cf 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -47,6 +47,7 @@
+ #include "archive_integer.h"
+ #include "archive_ppmd7_private.h"
+ #include "archive_entry_private.h"
++#include "archive_cryptor_private.h"
+ #include "archive_time_private.h"
+ 
+ #ifdef HAVE_BLAKE2_H
+@@ -366,6 +367,27 @@ struct rar5 {
+ 	 */
+ 	int has_encrypted_entries;
+ 	int headers_are_encrypted;
++
++	/*
++	 * State for an archive whose headers are encrypted (rar -hp). Every
++	 * block after HEAD_CRYPT is preceded by its own 16 byte IV and then
++	 * AES-256-CBC ciphertext padded up to a block boundary, so a header
++	 * cannot be parsed straight out of the read stream. Instead the whole
++	 * padded block is decrypted into `buf`, and read_ahead()/consume() are
++	 * redirected there for the duration of the parse -- which transparently
++	 * covers every sub-parser, since they all read through those two.
++	 */
++	struct {
++		int enabled;      /* HEAD_CRYPT seen; later headers encrypted */
++		int serving;      /* read_ahead/consume redirect to buf */
++		unsigned kdf_count;   /* iterations are 1 << kdf_count */
++		uint8_t salt[16];
++		uint8_t key[32];
++		uint8_t *buf;
++		size_t buf_cap;
++		size_t buf_len;   /* decrypted bytes, padding excluded */
++		size_t buf_pos;   /* read cursor while serving */
++	} hdrcrypt;
+ };
+ 
+ /* Forward function declarations. */
+@@ -373,6 +395,7 @@ struct rar5 {
+ static void rar5_signature(char *buf);
+ static int verify_global_checksums(struct archive_read* a);
+ static int rar5_read_data_skip(struct archive_read *a);
++static int rar5_read_data_skip_internal(struct archive_read *a);
+ static int push_data_ready(struct archive_read* a, struct rar5 *rar5,
+ 	const uint8_t* buf, size_t size, int64_t offset);
+ static void clear_data_ready_stack(struct rar5 *rar5);
+@@ -899,12 +922,47 @@ static inline int get_archive_read(struct archive* a,
+ 	return ARCHIVE_OK;
+ }
+ 
++/* Largest KDF shift accepted. RAR stores the iteration count as a shift, so an
++ * absurd value would otherwise turn opening an archive into a denial of
++ * service. Real archives use 15 (32768 iterations). */
++#define RAR5_MAX_KDF_SHIFT 24
++#define RAR5_CRYPT_BLOCK   16
++/*
++ * Zero padding kept past the end of a decrypted header. read_var() asks for 10
++ * bytes to decode a value that is often a single byte, which the stream always
++ * satisfies from whatever follows, but a buffer holding exactly one header
++ * cannot. Serving those over-reads out of a zero filled tail keeps the vint
++ * decoder happy -- a zero byte terminates a value -- while consume() still
++ * refuses to move the cursor past the real end of the header.
++ */
++#define RAR5_HDR_SLACK     16
++/*
++ * Upper bound on passphrase attempts. A registered passphrase list runs out on
++ * its own -- next_passphrase() returns NULL once every candidate has failed --
++ * but a caller that installs a passphrase *callback* (bsdtar prompting on a
++ * terminal, say) can keep handing back new ones forever, so the loop needs its
++ * own ceiling to stay finite.
++ */
++#define RAR5_MAX_PASSPHRASE_TRIES 100
++
+ static int read_ahead(struct archive_read* a, size_t how_many,
+     const uint8_t** ptr)
+ {
++	struct rar5* rar5 = a->format->data;
++
+ 	if(!ptr)
+ 		return 0;
+ 
++	/* Serving a decrypted header: satisfy the read from that buffer, so the
++	 * ordinary parsers need no knowledge of encryption at all. */
++	if(rar5 != NULL && rar5->hdrcrypt.serving) {
++		if(rar5->hdrcrypt.buf_pos + how_many >
++		    rar5->hdrcrypt.buf_len + RAR5_HDR_SLACK)
++			return 0;
++		*ptr = rar5->hdrcrypt.buf + rar5->hdrcrypt.buf_pos;
++		return 1;
++	}
++
+ 	*ptr = __archive_read_ahead(a, how_many, NULL);
+ 	if(*ptr == NULL) {
+ 		return 0;
+@@ -914,8 +972,17 @@ static int read_ahead(struct archive_read* a, size_t how_many,
+ }
+ 
+ static int consume(struct archive_read* a, int64_t how_many) {
++	struct rar5* rar5 = a->format->data;
+ 	int ret;
+ 
++	if(rar5 != NULL && rar5->hdrcrypt.serving) {
++		if(how_many < 0 || rar5->hdrcrypt.buf_pos + (size_t)how_many >
++		    rar5->hdrcrypt.buf_len)
++			return ARCHIVE_FATAL;
++		rar5->hdrcrypt.buf_pos += (size_t)how_many;
++		return ARCHIVE_OK;
++	}
++
+ 	ret = how_many == __archive_read_consume(a, how_many)
+ 		? ARCHIVE_OK
+ 		: ARCHIVE_FATAL;
+@@ -923,6 +990,211 @@ static int consume(struct archive_read* a, int64_t how_many) {
+ 	return ret;
+ }
+ 
++/* Decode a RAR5 variable sized value straight out of a buffer. read_var()
++ * cannot be used for this: it reads through the stream, and the bytes being
++ * decoded here have only just been decrypted into memory. */
++static int
++rar5_vint_buf(const uint8_t* p, size_t avail, uint64_t* pvalue, size_t* plen)
++{
++	uint64_t result = 0;
++	size_t i;
++
++	for(i = 0; i < avail && i < 10; i++) {
++		result |= (uint64_t)(p[i] & 0x7f) << (7 * i);
++		if((p[i] & 0x80) == 0) {
++			*pvalue = result;
++			*plen = i + 1;
++			return 1;
++		}
++	}
++
++	return 0;
++}
++
++/* Read `n` bytes out of the stream into a caller supplied buffer. */
++static int
++rar5_read_exact(struct archive_read* a, uint8_t* dst, size_t n)
++{
++	const uint8_t* p;
++
++	if(!read_ahead(a, n, &p))
++		return 0;
++	memcpy(dst, p, n);
++	return consume(a, (int64_t)n) == ARCHIVE_OK;
++}
++
++/*
++ * Derive the archive key from the passphrase, and check it against the
++ * password verification value when the archive carries one.
++ *
++ * Both come from the same PBKDF2-HMAC-SHA256 chain over (passphrase, salt):
++ * the key is the value after `1 << kdf_count` iterations, while the check
++ * value is the value 32 iterations further on, folded from 32 bytes down to 8
++ * by XOR. Checking it means a wrong passphrase is reported as such, instead of
++ * surfacing later as unreadable garbage.
++ */
++static int
++rar5_derive_key(struct archive_read* a, struct rar5* rar5, const char* pw,
++    const uint8_t* check_value, int have_check)
++{
++	uint8_t hash[32], check[8];
++	unsigned rounds;
++	size_t i;
++	int ret;
++
++	if(rar5->hdrcrypt.kdf_count > RAR5_MAX_KDF_SHIFT) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Unsupported RAR5 KDF count");
++		return ARCHIVE_FATAL;
++	}
++	rounds = 1U << rar5->hdrcrypt.kdf_count;
++
++	ret = archive_pbkdf2_sha256(pw, strlen(pw), rar5->hdrcrypt.salt,
++	    sizeof(rar5->hdrcrypt.salt), rounds, rar5->hdrcrypt.key,
++	    sizeof(rar5->hdrcrypt.key));
++	if(ret != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    ret == CRYPTOR_STUB_FUNCTION
++			? "Decryption is unsupported due to lack of crypto library"
++			: "Failed to derive the archive key");
++		return ARCHIVE_FATAL;
++	}
++
++	if(!have_check)
++		return ARCHIVE_OK;
++
++	if(archive_pbkdf2_sha256(pw, strlen(pw), rar5->hdrcrypt.salt,
++	    sizeof(rar5->hdrcrypt.salt), rounds + 32, hash, sizeof(hash)) != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Failed to derive the password check value");
++		return ARCHIVE_FATAL;
++	}
++
++	memset(check, 0, sizeof(check));
++	for(i = 0; i < sizeof(hash); i++)
++		check[i & (sizeof(check) - 1)] ^= hash[i];
++
++	if(memcmp(check, check_value, sizeof(check)) != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Incorrect passphrase");
++		return ARCHIVE_FAILED;
++	}
++
++	return ARCHIVE_OK;
++}
++
++/*
++ * Pull one encrypted header block off the stream and decrypt it into
++ * rar5->hdrcrypt.buf, leaving read_ahead()/consume() serving from there.
++ *
++ * The block's own length is inside the ciphertext, so this happens in two
++ * steps: decrypt the leading block to read the CRC and the header size, then
++ * decrypt the whole thing -- from the same IV, since CBC state cannot be
++ * rewound -- and hide the padding by reporting only the real header length.
++ */
++static int
++rar5_read_encrypted_header(struct archive_read* a, struct rar5* rar5)
++{
++	const uint8_t* p;
++	uint8_t iv[RAR5_CRYPT_BLOCK], probe[RAR5_CRYPT_BLOCK];
++	archive_cbc_ctx ctx;
++	uint64_t raw_hdr_size;
++	size_t hdr_size_len, plain_len, total, out_len;
++	int ret;
++
++	if(!rar5_read_exact(a, iv, sizeof(iv)))
++		return ARCHIVE_EOF;
++
++	if(!read_ahead(a, sizeof(probe), &p))
++		return ARCHIVE_EOF;
++
++	if(archive_decrypto_aes_cbc_init(&ctx, rar5->hdrcrypt.key,
++	    sizeof(rar5->hdrcrypt.key), iv) != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Failed to initialize header decryption");
++		return ARCHIVE_FATAL;
++	}
++	out_len = sizeof(probe);
++	ret = archive_decrypto_aes_cbc_update(&ctx, p, sizeof(probe), probe,
++	    &out_len);
++	archive_decrypto_aes_cbc_release(&ctx);
++	if(ret != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Failed to decrypt the block header");
++		return ARCHIVE_FATAL;
++	}
++
++	/* 4 byte CRC, then the header size as a variable sized value. A vint is
++	 * at most 10 bytes, so it always lies inside this first block. */
++	if(!rar5_vint_buf(probe + 4, sizeof(probe) - 4, &raw_hdr_size,
++	    &hdr_size_len)) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Invalid encrypted block header");
++		return ARCHIVE_FATAL;
++	}
++
++	plain_len = 4 + hdr_size_len + (size_t)raw_hdr_size;
++	if(raw_hdr_size == 0 || plain_len > (2 * 1024 * 1024)) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Invalid encrypted block header size");
++		return ARCHIVE_FATAL;
++	}
++
++	total = ((plain_len + RAR5_CRYPT_BLOCK - 1) / RAR5_CRYPT_BLOCK) *
++	    RAR5_CRYPT_BLOCK;
++
++	if(rar5->hdrcrypt.buf_cap < total + RAR5_HDR_SLACK) {
++		uint8_t* nb = realloc(rar5->hdrcrypt.buf,
++		    total + RAR5_HDR_SLACK);
++		if(nb == NULL) {
++			archive_set_error(&a->archive, ENOMEM,
++			    "Cannot allocate memory for a decrypted header");
++			return ARCHIVE_FATAL;
++		}
++		rar5->hdrcrypt.buf = nb;
++		rar5->hdrcrypt.buf_cap = total + RAR5_HDR_SLACK;
++	}
++
++	if(!read_ahead(a, total, &p))
++		return ARCHIVE_EOF;
++
++	if(archive_decrypto_aes_cbc_init(&ctx, rar5->hdrcrypt.key,
++	    sizeof(rar5->hdrcrypt.key), iv) != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Failed to initialize header decryption");
++		return ARCHIVE_FATAL;
++	}
++	out_len = total;
++	ret = archive_decrypto_aes_cbc_update(&ctx, p, total,
++	    rar5->hdrcrypt.buf, &out_len);
++	archive_decrypto_aes_cbc_release(&ctx);
++	if(ret != 0 || out_len < plain_len) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++		    "Failed to decrypt the block header");
++		return ARCHIVE_FATAL;
++	}
++
++	/* Anything past the header itself -- the encryption padding, then the
++	 * slack -- must read as zeroes, so an over-read cannot pick up
++	 * ciphertext-derived garbage and decode it as a value. */
++	memset(rar5->hdrcrypt.buf + plain_len, 0,
++	    rar5->hdrcrypt.buf_cap - plain_len);
++
++	/* Step over the encrypted block in the real stream BEFORE redirecting,
++	 * because consume() honours the serving flag and would otherwise just
++	 * move the buffer cursor and leave the stream parked on the ciphertext. */
++	if(consume(a, (int64_t)total) != ARCHIVE_OK)
++		return ARCHIVE_EOF;
++
++	/* The padding is not part of the header and must not be visible to the
++	 * parsers, which would otherwise read past its end. */
++	rar5->hdrcrypt.buf_len = plain_len;
++	rar5->hdrcrypt.buf_pos = 0;
++	rar5->hdrcrypt.serving = 1;
++
++	return ARCHIVE_OK;
++}
++
+ /**
+  * Read a RAR5 variable sized numeric value. This value will be stored in
+  * `pvalue`. The `pvalue_len` argument points to a variable that will receive
+@@ -2256,6 +2528,76 @@ static int scan_for_signature(struct archive_read* a);
+  * <FILE> block.
+  */
+ 
++/*
++ * HEAD_CRYPT describes how the rest of the archive is encrypted. It is itself
++ * in the clear -- it has to be, since it carries the salt needed to derive the
++ * key -- and every block after it is encrypted.
++ */
++static int
++process_head_crypt(struct archive_read* a, struct rar5* rar5)
++{
++	size_t version = 0, enc_flags = 0;
++	uint8_t kdf_count = 0;
++	uint8_t check_value[12];
++	int have_check, ret, tries, tried_one = 0;
++
++	if(!read_var_sized(a, &version, NULL))
++		return ARCHIVE_EOF;
++	if(version != 0) {
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++		    "Unsupported RAR5 encryption version: %d", (int)version);
++		return ARCHIVE_FATAL;
++	}
++	if(!read_var_sized(a, &enc_flags, NULL))
++		return ARCHIVE_EOF;
++	if(!rar5_read_exact(a, &kdf_count, 1))
++		return ARCHIVE_EOF;
++	if(!rar5_read_exact(a, rar5->hdrcrypt.salt,
++	    sizeof(rar5->hdrcrypt.salt)))
++		return ARCHIVE_EOF;
++
++	have_check = (enc_flags & 0x01) != 0;
++	if(have_check &&
++	    !rar5_read_exact(a, check_value, sizeof(check_value)))
++		return ARCHIVE_EOF;
++
++	rar5->hdrcrypt.kdf_count = kdf_count;
++
++	/* Rewind the passphrase iterator before using it: it starts parked on
++	 * "no candidate", so the first next() call returns NULL until reset. */
++	__archive_read_reset_passphrase(a);
++
++	/* Walk the passphrases the caller offers, stopping at the first one the
++	 * check value accepts. Without a check value the first is taken on
++	 * trust, and a wrong one shows up as a header CRC error further on. */
++	for(tries = 0; tries < RAR5_MAX_PASSPHRASE_TRIES; tries++) {
++		const char* pw = __archive_read_next_passphrase(a);
++
++		/* NULL means the candidate list is exhausted; empty means a
++		 * callback had nothing to give (a prompt with no terminal). */
++		if(pw == NULL || pw[0] == '\0')
++			break;
++
++		tried_one = 1;
++		ret = rar5_derive_key(a, rar5, pw, check_value, have_check);
++		if(ret == ARCHIVE_OK) {
++			rar5->hdrcrypt.enabled = 1;
++			return ARCHIVE_OK;
++		}
++		/* Anything other than a rejected passphrase is terminal. */
++		if(ret != ARCHIVE_FAILED)
++			return ret;
++	}
++
++	/* Fatal rather than failed: with the headers encrypted and no key,
++	 * there is nothing further that can be read from this archive, and
++	 * carrying on would only produce bogus entries and CRC errors. */
++	archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++	    tried_one ? "Incorrect passphrase"
++		      : "Passphrase required for this archive");
++	return ARCHIVE_FATAL;
++}
++
+ /*
+  * A header that carries no file data (HEAD_MAIN, or an unknown block
+  * flagged HFL_SKIP_IF_UNKNOWN) may leave bytes in its body that the
+@@ -2283,8 +2625,43 @@ rar5_skip_remaining_block(struct archive_read* a,
+ 	}
+ }
+ 
++static int process_base_block_internal(struct archive_read* a,
++    struct archive_entry* entry);
++
++/*
++ * Reads one block header, transparently decrypting it first when the archive
++ * uses encrypted headers. Redirecting read_ahead()/consume() at the decrypted
++ * copy is scoped strictly to the parse: it is switched off on every exit path,
++ * so the file data that follows is read from the real stream as usual.
++ */
+ static int process_base_block(struct archive_read* a,
+     struct archive_entry* entry)
++{
++	struct rar5* rar5 = a->format->data;
++	int ret;
++
++	/* Leftover data bytes from the previous entry live in the real stream,
++	 * so this has to happen before the redirect is armed. */
++	ret = skip_unprocessed_bytes(a);
++	if(ret != ARCHIVE_OK)
++		return ret;
++
++	if(rar5->hdrcrypt.enabled) {
++		ret = rar5_read_encrypted_header(a, rar5);
++		if(ret != ARCHIVE_OK) {
++			rar5->hdrcrypt.serving = 0;
++			return ret;
++		}
++	}
++
++	ret = process_base_block_internal(a, entry);
++	rar5->hdrcrypt.serving = 0;
++
++	return ret;
++}
++
++static int process_base_block_internal(struct archive_read* a,
++    struct archive_entry* entry)
+ {
+ 	const size_t SMALLEST_RAR5_BLOCK_SIZE = 3;
+ 
+@@ -2303,11 +2680,6 @@ static int process_base_block(struct archive_read* a,
+ 		HEAD_UNKNOWN = 0xff,
+ 	};
+ 
+-	/* Skip any unprocessed data for this file. */
+-	ret = skip_unprocessed_bytes(a);
+-	if(ret != ARCHIVE_OK)
+-		return ret;
+-
+ 	/* Read the expected CRC32 checksum. */
+ 	if(!read_u32(a, &hdr_crc)) {
+ 		return ARCHIVE_EOF;
+@@ -2403,10 +2775,15 @@ static int process_base_block(struct archive_read* a,
+ 			archive_entry_set_is_data_encrypted(entry, 1);
+ 			rar5->has_encrypted_entries = 1;
+ 			rar5->headers_are_encrypted = 1;
+-			archive_set_error(&a->archive,
+-			    ARCHIVE_ERRNO_FILE_FORMAT,
+-			    "Encryption is not supported");
+-			return ARCHIVE_FATAL;
++
++			ret = process_head_crypt(a, rar5);
++			if(ret != ARCHIVE_OK)
++				return ret;
++
++			/* This block describes the archive rather than a file,
++			 * so move on to the next header -- now encrypted. */
++			rar5_skip_remaining_block(a, body_start, raw_hdr_size);
++			return ARCHIVE_RETRY;
+ 		case HEAD_ENDARC:
+ 			rar5->main.endarc = 1;
+ 
+@@ -4333,8 +4710,27 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
+ 	return ARCHIVE_OK;
+ }
+ 
++/*
++ * Entry data always lives in the real read stream, never in the decrypted
++ * header buffer, so a skip must never be redirected. This matters because a
++ * SERVICE block skips its own data from inside the header parse, while the
++ * redirect is still armed -- consume() would otherwise refuse the skip as an
++ * over-read of the header and fail the archive at the very last block.
++ */
+ static int rar5_read_data_skip(struct archive_read *a) {
+ 	struct rar5 *rar5 = a->format->data;
++	int serving = rar5->hdrcrypt.serving;
++	int ret;
++
++	rar5->hdrcrypt.serving = 0;
++	ret = rar5_read_data_skip_internal(a);
++	rar5->hdrcrypt.serving = serving;
++
++	return ret;
++}
++
++static int rar5_read_data_skip_internal(struct archive_read *a) {
++	struct rar5 *rar5 = a->format->data;
+ 
+ 	if(rar5->main.solid && (rar5->cstate.data_encrypted == 0)) {
+ 		/* In solid archives, instead of skipping the data, we need to
+@@ -4409,6 +4805,7 @@ static int rar5_cleanup(struct archive_read *a) {
+ 	clear_data_ready_stack(rar5);
+ 
+ 	free(rar5->vol.push_buf);
++	free(rar5->hdrcrypt.buf);
+ 
+ 	free_filters(rar5);
+ 	rar5_deinit(rar5);
