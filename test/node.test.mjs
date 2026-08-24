@@ -51,6 +51,24 @@ describe("Extract file using nodejs", () => {
     await archive.close();
   }, 30000);
 
+  test("Extract password-protected RAR4 data", async () => {
+    const buffer = fs.readFileSync(
+      "test/files/archives/rar/encrypted-v4.rar",
+    );
+    const archive = await Archive.open(new Blob([buffer]));
+
+    await archive.usePassword("rar4-secret");
+    const checksumObj = await fileChecksums(await archive.extractFiles());
+
+    expect(checksumObj).toEqual({
+      "message.txt":
+        "b1b606b099f2e3270b0924d8eabfaebbd30cd2cdc457d34c5c71176d24ad2370",
+      "pattern.bin":
+        "6fc179cfd193754e6109ad043f56d146c7e7d7c3623ffceae318266286f58388",
+    });
+    await archive.close();
+  }, 30000);
+
   test("Reject an incorrect RAR5 password", async () => {
     const buffer = fs.readFileSync(
       "test/files/archives/rar/encrypted-v5-stored.rar",

@@ -1,0 +1,637 @@
+diff --git a/libarchive/archive_read_support_format_rar.c b/libarchive/archive_read_support_format_rar.c
+index ff764f5..1ae6b2e 100644
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -36,6 +36,7 @@
+ #endif
+ 
+ #include "archive.h"
++#include "archive_cryptor_private.h"
+ #ifndef HAVE_ZLIB_H
+ #include "archive_crc32.h"
+ #endif
+@@ -391,6 +392,26 @@ struct rar
+    * Custom field to denote that this archive contains encrypted entries
+    */
+   int has_encrypted_entries;
++
++  /* Streaming AES-CBC state for an encrypted RAR3/RAR4 entry. */
++  struct {
++    int active;
++    int ctx_valid;
++    archive_cbc_ctx ctx;
++    uint8_t key[16];
++    uint8_t iv[16];
++    uint8_t *buf;
++    size_t buf_cap;
++    size_t buf_len;
++    size_t buf_pos;
++    int64_t enc_remaining;
++    uint8_t cached_salt[8];
++    size_t cached_salt_len;
++    uint8_t cached_key[16];
++    uint8_t cached_iv[16];
++    char *cached_password;
++    int cached_valid;
++  } datacrypt;
+ };
+ 
+ static int archive_read_support_format_rar_capabilities(struct archive_read *);
+@@ -407,6 +428,15 @@ static int64_t archive_read_format_rar_seek_data(struct archive_read *, int64_t,
+     int);
+ static int archive_read_format_rar_cleanup(struct archive_read *);
+ 
++#define RAR4_CRYPT_BLOCK 16
++#define RAR4_DATA_WINDOW (64 * 1024)
++
++static int rar4_datacrypt_start(struct archive_read *, struct rar *);
++static int rar4_datacrypt_fill(struct archive_read *, struct rar *, size_t);
++static int64_t rar4_consume(struct archive_read *, int64_t);
++static int rar4_datacrypt_finish(struct archive_read *, struct rar *);
++static void rar4_datacrypt_end(struct rar *);
++
+ /* Support functions */
+ static int read_header(struct archive_read *, struct archive_entry *, char);
+ static time_t get_time(int);
+@@ -454,6 +484,224 @@ static int copy_from_lzss_window(struct archive_read *, uint8_t *, int64_t, int)
+ static inline void vm_write_32(struct rar_virtual_machine*, size_t, uint32_t);
+ static inline uint32_t vm_read_32(struct rar_virtual_machine*, size_t);
+ 
++/*
++ * RAR3's key derivation is based on SHA-1, but it also preserves a bug in the
++ * old RAR implementation: full input blocks are overwritten with the final
++ * sixteen words of the SHA-1 message schedule and reused on later rounds.
++ * A regular SHA-1 API cannot reproduce that behavior, so keep the small
++ * compatible implementation here. The SHA-1 algorithm itself is public
++ * domain (Steve Reid's implementation is the historical reference used by
++ * UnRAR).
++ */
++struct rar4_sha1 {
++  uint32_t state[5];
++  uint64_t count;
++  uint8_t buffer[64];
++};
++
++static uint32_t
++rar4_rol32(uint32_t v, unsigned n)
++{
++  return (v << n) | (v >> (32 - n));
++}
++
++static void
++rar4_sha1_transform(uint32_t state[5], const uint8_t block[64],
++    uint8_t *mutated)
++{
++  uint32_t w[16];
++  uint32_t a, b, c, d, e, f, k, temp;
++  unsigned i;
++
++  for (i = 0; i < 16; i++)
++    w[i] = archive_be32dec(block + i * 4);
++
++  a = state[0];
++  b = state[1];
++  c = state[2];
++  d = state[3];
++  e = state[4];
++  for (i = 0; i < 80; i++) {
++    if (i >= 16)
++      w[i & 15] = rar4_rol32(w[(i + 13) & 15] ^ w[(i + 8) & 15] ^
++          w[(i + 2) & 15] ^ w[i & 15], 1);
++    if (i < 20) {
++      f = (b & (c ^ d)) ^ d;
++      k = 0x5a827999;
++    } else if (i < 40) {
++      f = b ^ c ^ d;
++      k = 0x6ed9eba1;
++    } else if (i < 60) {
++      f = ((b | c) & d) | (b & c);
++      k = 0x8f1bbcdc;
++    } else {
++      f = b ^ c ^ d;
++      k = 0xca62c1d6;
++    }
++    temp = rar4_rol32(a, 5) + f + e + k + w[i & 15];
++    e = d;
++    d = c;
++    c = rar4_rol32(b, 30);
++    b = a;
++    a = temp;
++  }
++
++  state[0] += a;
++  state[1] += b;
++  state[2] += c;
++  state[3] += d;
++  state[4] += e;
++
++  if (mutated != NULL) {
++    for (i = 0; i < 16; i++)
++      archive_le32enc(mutated + i * 4, w[i]);
++  }
++}
++
++static void
++rar4_sha1_init(struct rar4_sha1 *ctx)
++{
++  ctx->count = 0;
++  ctx->state[0] = 0x67452301;
++  ctx->state[1] = 0xefcdab89;
++  ctx->state[2] = 0x98badcfe;
++  ctx->state[3] = 0x10325476;
++  ctx->state[4] = 0xc3d2e1f0;
++}
++
++static void
++rar4_sha1_process(struct rar4_sha1 *ctx, uint8_t *data, size_t len,
++    int mutate)
++{
++  size_t i, j = (size_t)(ctx->count & 63);
++
++  ctx->count += len;
++  if (j + len > 63) {
++    i = 64 - j;
++    memcpy(ctx->buffer + j, data, i);
++    rar4_sha1_transform(ctx->state, ctx->buffer, NULL);
++    for (; i + 63 < len; i += 64)
++      rar4_sha1_transform(ctx->state, data + i,
++          mutate ? data + i : NULL);
++    j = 0;
++  } else {
++    i = 0;
++  }
++  if (len > i)
++    memcpy(ctx->buffer + j, data + i, len - i);
++}
++
++static void
++rar4_sha1_done(struct rar4_sha1 *ctx, uint32_t digest[5])
++{
++  uint64_t bit_length = ctx->count * 8;
++  unsigned pos = (unsigned)(ctx->count & 63);
++  unsigned i;
++
++  ctx->buffer[pos++] = 0x80;
++  if (pos > 56) {
++    memset(ctx->buffer + pos, 0, 64 - pos);
++    rar4_sha1_transform(ctx->state, ctx->buffer, NULL);
++    pos = 0;
++  }
++  memset(ctx->buffer + pos, 0, 56 - pos);
++  archive_be64enc(ctx->buffer + 56, bit_length);
++  rar4_sha1_transform(ctx->state, ctx->buffer, NULL);
++  for (i = 0; i < 5; i++)
++    digest[i] = ctx->state[i];
++}
++
++/* Convert the API's UTF-8 passphrase to the UTF-16LE bytes used by RAR3. */
++static int
++rar4_password_bytes(const char *password, uint8_t raw[254], size_t *raw_len)
++{
++  const uint8_t *p = (const uint8_t *)password;
++  size_t units = 0;
++
++  while (*p != 0 && units < 127) {
++    uint32_t cp;
++    size_t n;
++
++    if (p[0] < 0x80) {
++      cp = p[0]; n = 1;
++    } else if ((p[0] & 0xe0) == 0xc0 && p[1] != 0) {
++      cp = ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f); n = 2;
++      if ((p[1] & 0xc0) != 0x80 || cp < 0x80) return -1;
++    } else if ((p[0] & 0xf0) == 0xe0 && p[1] != 0 && p[2] != 0) {
++      cp = ((uint32_t)(p[0] & 0x0f) << 12) |
++          ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f); n = 3;
++      if ((p[1] & 0xc0) != 0x80 || (p[2] & 0xc0) != 0x80 ||
++          cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff)) return -1;
++    } else if ((p[0] & 0xf8) == 0xf0 && p[1] != 0 && p[2] != 0 &&
++        p[3] != 0) {
++      cp = ((uint32_t)(p[0] & 7) << 18) |
++          ((uint32_t)(p[1] & 0x3f) << 12) |
++          ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f); n = 4;
++      if ((p[1] & 0xc0) != 0x80 || (p[2] & 0xc0) != 0x80 ||
++          (p[3] & 0xc0) != 0x80 || cp < 0x10000 || cp > 0x10ffff)
++        return -1;
++    } else {
++      return -1;
++    }
++    p += n;
++
++    if (cp <= 0xffff) {
++      archive_le16enc(raw + units * 2, (uint16_t)cp);
++      units++;
++    } else {
++      if (units + 2 > 127)
++        break;
++      cp -= 0x10000;
++      archive_le16enc(raw + units * 2, (uint16_t)(0xd800 + (cp >> 10)));
++      archive_le16enc(raw + (units + 1) * 2,
++          (uint16_t)(0xdc00 + (cp & 0x3ff)));
++      units += 2;
++    }
++  }
++  *raw_len = units * 2;
++  return 0;
++}
++
++static int
++rar4_derive_key(const char *password, const uint8_t *salt, size_t salt_len,
++    uint8_t key[16], uint8_t iv[16])
++{
++  struct rar4_sha1 ctx, tmp;
++  uint8_t raw[254 + 8];
++  uint8_t round[3];
++  uint32_t digest[5];
++  size_t raw_len;
++  unsigned i, j;
++
++  if (rar4_password_bytes(password, raw, &raw_len) != 0)
++    return -1;
++  if (salt_len != 0) {
++    memcpy(raw + raw_len, salt, salt_len);
++    raw_len += salt_len;
++  }
++
++  rar4_sha1_init(&ctx);
++  for (i = 0; i < 0x40000; i++) {
++    rar4_sha1_process(&ctx, raw, raw_len, 1);
++    round[0] = (uint8_t)i;
++    round[1] = (uint8_t)(i >> 8);
++    round[2] = (uint8_t)(i >> 16);
++    rar4_sha1_process(&ctx, round, sizeof(round), 0);
++    if ((i & 0x3fff) == 0) {
++      tmp = ctx;
++      rar4_sha1_done(&tmp, digest);
++      iv[i >> 14] = (uint8_t)digest[4];
++    }
++  }
++  rar4_sha1_done(&ctx, digest);
++  for (i = 0; i < 4; i++)
++    for (j = 0; j < 4; j++)
++      key[i * 4 + j] = (uint8_t)(digest[i] >> (j * 8));
++  memset(raw, 0, sizeof(raw));
++  memset(digest, 0, sizeof(digest));
++  return 0;
++}
++
+ /*
+  * Bit stream reader.
+  */
+@@ -571,7 +819,7 @@ rar_br_fillup(struct archive_read *a, struct rar_br *br)
+       if (rar->bytes_unconsumed > 0) {
+         /* Consume as much as the decompressor
+          * actually used. */
+-        __archive_read_consume(a, rar->bytes_unconsumed);
++        rar4_consume(a, rar->bytes_unconsumed);
+         rar->bytes_unconsumed = 0;
+       }
+       br->next_in = rar_read_ahead(a, 1, &(br->avail_in));
+@@ -723,6 +971,187 @@ ppmd_read(void *p)
+   return b;
+ }
+ 
++static int
++rar4_datacrypt_start(struct archive_read *a, struct rar *rar)
++{
++  const char *password;
++  size_t salt_len = (rar->file_flags & FHD_SALT) ? sizeof(rar->salt) : 0;
++  int cache_match;
++
++  __archive_read_reset_passphrase(a);
++  password = __archive_read_next_passphrase(a);
++  if (password == NULL || password[0] == '\0') {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++        "Passphrase required for this entry");
++    return ARCHIVE_FATAL;
++  }
++
++  cache_match = rar->datacrypt.cached_valid &&
++      rar->datacrypt.cached_salt_len == salt_len &&
++      (salt_len == 0 || memcmp(rar->datacrypt.cached_salt, rar->salt,
++          salt_len) == 0) &&
++      strcmp(rar->datacrypt.cached_password, password) == 0;
++  if (cache_match) {
++    memcpy(rar->datacrypt.key, rar->datacrypt.cached_key,
++        sizeof(rar->datacrypt.key));
++    memcpy(rar->datacrypt.iv, rar->datacrypt.cached_iv,
++        sizeof(rar->datacrypt.iv));
++  } else {
++    char *saved_password;
++
++    if (rar4_derive_key(password, (const uint8_t *)rar->salt, salt_len,
++        rar->datacrypt.key, rar->datacrypt.iv) != 0) {
++      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++          "RAR4 passphrase is not valid UTF-8");
++      return ARCHIVE_FATAL;
++    }
++    saved_password = strdup(password);
++    if (saved_password == NULL) {
++      archive_set_error(&a->archive, ENOMEM,
++          "Cannot cache RAR4 passphrase");
++      return ARCHIVE_FATAL;
++    }
++    free(rar->datacrypt.cached_password);
++    rar->datacrypt.cached_password = saved_password;
++    rar->datacrypt.cached_salt_len = salt_len;
++    if (salt_len != 0)
++      memcpy(rar->datacrypt.cached_salt, rar->salt, salt_len);
++    memcpy(rar->datacrypt.cached_key, rar->datacrypt.key,
++        sizeof(rar->datacrypt.key));
++    memcpy(rar->datacrypt.cached_iv, rar->datacrypt.iv,
++        sizeof(rar->datacrypt.iv));
++    rar->datacrypt.cached_valid = 1;
++  }
++
++  rar->datacrypt.enc_remaining = rar->packed_size;
++  rar->datacrypt.buf_len = 0;
++  rar->datacrypt.buf_pos = 0;
++  rar->datacrypt.active = 1;
++  return ARCHIVE_OK;
++}
++
++static int
++rar4_datacrypt_fill(struct archive_read *a, struct rar *rar, size_t need)
++{
++  size_t avail = rar->datacrypt.buf_len - rar->datacrypt.buf_pos;
++
++  if (avail >= need)
++    return ARCHIVE_OK;
++  if (!rar->datacrypt.ctx_valid) {
++    int ret = archive_decrypto_aes_cbc_init(&rar->datacrypt.ctx,
++        rar->datacrypt.key, sizeof(rar->datacrypt.key), rar->datacrypt.iv);
++    if (ret != 0) {
++      archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++          ret == CRYPTOR_STUB_FUNCTION
++            ? "Decryption is unsupported due to lack of crypto library"
++            : "Failed to initialize RAR4 entry decryption");
++      return ARCHIVE_FATAL;
++    }
++    rar->datacrypt.ctx_valid = 1;
++  }
++
++  if (rar->datacrypt.buf_pos != 0) {
++    memmove(rar->datacrypt.buf,
++        rar->datacrypt.buf + rar->datacrypt.buf_pos, avail);
++    rar->datacrypt.buf_len = avail;
++    rar->datacrypt.buf_pos = 0;
++  }
++
++  if (avail < need) {
++    size_t missing = need - avail;
++    size_t min_cap = avail + ((missing + RAR4_CRYPT_BLOCK - 1) /
++        RAR4_CRYPT_BLOCK) * RAR4_CRYPT_BLOCK;
++    size_t cap = min_cap < RAR4_DATA_WINDOW ? RAR4_DATA_WINDOW : min_cap;
++
++    if (rar->datacrypt.buf_cap < min_cap) {
++      uint8_t *newbuf = realloc(rar->datacrypt.buf, cap);
++      if (newbuf == NULL) {
++        archive_set_error(&a->archive, ENOMEM,
++            "Cannot allocate memory for decrypted RAR4 data");
++        return ARCHIVE_FATAL;
++      }
++      rar->datacrypt.buf = newbuf;
++      rar->datacrypt.buf_cap = cap;
++    }
++  }
++
++  while (rar->datacrypt.buf_len < need) {
++    const uint8_t *p;
++    size_t want = rar->datacrypt.buf_cap - rar->datacrypt.buf_len;
++    size_t out_len;
++
++    if ((int64_t)want > rar->datacrypt.enc_remaining)
++      want = (size_t)rar->datacrypt.enc_remaining;
++    want -= want % RAR4_CRYPT_BLOCK;
++    if (want == 0) {
++      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++          "Truncated encrypted RAR4 data");
++      return ARCHIVE_FATAL;
++    }
++    p = __archive_read_ahead(a, want, NULL);
++    if (p == NULL)
++      return ARCHIVE_FATAL;
++    out_len = want;
++    if (archive_decrypto_aes_cbc_update(&rar->datacrypt.ctx, p, want,
++        rar->datacrypt.buf + rar->datacrypt.buf_len, &out_len) != 0 ||
++        out_len != want) {
++      archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++          "Failed to decrypt RAR4 entry data");
++      return ARCHIVE_FATAL;
++    }
++    if (want != (size_t)__archive_read_consume(a, (int64_t)want))
++      return ARCHIVE_FATAL;
++    rar->datacrypt.buf_len += want;
++    rar->datacrypt.enc_remaining -= (int64_t)want;
++  }
++  return ARCHIVE_OK;
++}
++
++static int64_t
++rar4_consume(struct archive_read *a, int64_t count)
++{
++  struct rar *rar = a->format->data;
++
++  if (!rar->datacrypt.active)
++    return __archive_read_consume(a, count);
++  if (count < 0 || rar->datacrypt.buf_pos + (size_t)count >
++      rar->datacrypt.buf_len)
++    return -1;
++  rar->datacrypt.buf_pos += (size_t)count;
++  return count;
++}
++
++static void
++rar4_datacrypt_end(struct rar *rar)
++{
++  if (rar->datacrypt.ctx_valid) {
++    archive_decrypto_aes_cbc_release(&rar->datacrypt.ctx);
++    rar->datacrypt.ctx_valid = 0;
++  }
++  rar->datacrypt.active = 0;
++  rar->datacrypt.buf_len = 0;
++  rar->datacrypt.buf_pos = 0;
++  rar->datacrypt.enc_remaining = 0;
++}
++
++static int
++rar4_datacrypt_finish(struct archive_read *a, struct rar *rar)
++{
++  int64_t rest;
++
++  if (!rar->datacrypt.active)
++    return ARCHIVE_OK;
++  rest = rar->datacrypt.enc_remaining;
++  rar4_datacrypt_end(rar);
++  rar->bytes_remaining = 0;
++  rar->bytes_unconsumed = 0;
++  rar->br.avail_in = 0;
++  rar->br.next_in = NULL;
++  if (rest > 0 && __archive_read_consume(a, rest) != rest)
++    return ARCHIVE_FATAL;
++  return ARCHIVE_OK;
++}
++
+ int
+ archive_read_support_format_rar(struct archive *_a)
+ {
+@@ -914,6 +1343,12 @@ archive_read_format_rar_read_header(struct archive_read *a,
+   unsigned flags;
+   unsigned long crc32_expected;
+ 
++  if (rar->datacrypt.active) {
++    ret = rar4_datacrypt_finish(a, rar);
++    if (ret != ARCHIVE_OK)
++      return ret;
++  }
++
+   a->archive.archive_format = ARCHIVE_FORMAT_RAR;
+   if (a->archive.archive_format_name == NULL)
+     a->archive.archive_format_name = "RAR";
+@@ -1105,12 +1540,12 @@ archive_read_format_rar_read_data(struct archive_read *a, const void **buff,
+ 
+   if (rar->bytes_unconsumed > 0) {
+       /* Consume as much as the decompressor actually used. */
+-      __archive_read_consume(a, rar->bytes_unconsumed);
++      rar4_consume(a, rar->bytes_unconsumed);
+       rar->bytes_unconsumed = 0;
+   }
+ 
+   *buff = NULL;
+-  if (rar->entry_eof || rar->offset_seek >= rar->unp_size) {
++  if (rar->entry_eof) {
+     *size = 0;
+     *offset = rar->offset;
+     return (ARCHIVE_EOF);
+@@ -1153,10 +1588,13 @@ archive_read_format_rar_read_data_skip(struct archive_read *a)
+ 
+   if (rar->bytes_unconsumed > 0) {
+       /* Consume as much as the decompressor actually used. */
+-      __archive_read_consume(a, rar->bytes_unconsumed);
++      rar4_consume(a, rar->bytes_unconsumed);
+       rar->bytes_unconsumed = 0;
+   }
+ 
++  if (rar->datacrypt.active)
++    return rar4_datacrypt_finish(a, rar);
++
+   if (rar->bytes_remaining > 0) {
+     bytes_skipped = __archive_read_consume(a, rar->bytes_remaining);
+     if (bytes_skipped < 0)
+@@ -1187,6 +1625,12 @@ archive_read_format_rar_seek_data(struct archive_read *a, int64_t offset,
+   int64_t client_offset, ret;
+   size_t i;
+ 
++  if (rar->file_flags & FHD_PASSWORD) {
++    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++        "Seeking encrypted RAR4 entries is unsupported");
++    return ARCHIVE_FAILED;
++  }
++
+   if (rar->compression_method == COMPRESS_METHOD_STORE)
+   {
+     /* Modify the offset for use with SEEK_SET */
+@@ -1344,6 +1788,7 @@ archive_read_format_rar_cleanup(struct archive_read *a)
+ {
+   struct rar *rar = a->format->data;
+ 
++  rar4_datacrypt_end(rar);
+   free_codes(a);
+   clear_filters(&rar->filters);
+   free(rar->filename);
+@@ -1351,6 +1796,8 @@ archive_read_format_rar_cleanup(struct archive_read *a)
+   free(rar->dbo);
+   free(rar->unp_buffer);
+   free(rar->lzss.window);
++  free(rar->datacrypt.buf);
++  free(rar->datacrypt.cached_password);
+   __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
+   free(rar);
+   a->format->data = NULL;
+@@ -1467,12 +1914,6 @@ read_header(struct archive_read *a, struct archive_entry *entry,
+   {
+     archive_entry_set_is_data_encrypted(entry, 1);
+     rar->has_encrypted_entries = 1;
+-    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                      "RAR encryption support unavailable");
+-    /* Since it is only the data part itself that is encrypted we can at least
+-       extract information about the currently processed entry and don't need
+-       to return ARCHIVE_FATAL here. */
+-    /*return (ARCHIVE_FATAL);*/
+   }
+ 
+   if (rar->file_flags & FHD_LARGE)
+@@ -1844,6 +2285,12 @@ read_header(struct archive_read *a, struct archive_entry *entry,
+     ret = (ARCHIVE_WARN);
+   }
+ 
++  if ((rar->file_flags & FHD_PASSWORD) && rar->packed_size > 0) {
++    ret2 = rar4_datacrypt_start(a, rar);
++    if (ret2 != ARCHIVE_OK)
++      return ret2;
++  }
++
+   if (((rar->mode) & AE_IFMT) == AE_IFLNK)
+   {
+     /* Make sure a symbolic-link file does not have its body. */
+@@ -1994,7 +2441,7 @@ read_symlink_stored(struct archive_read *a, struct archive_entry *entry,
+                       archive_string_conversion_charset_name(sconv));
+     ret = (ARCHIVE_WARN);
+   }
+-  __archive_read_consume(a, rar->packed_size);
++  rar4_consume(a, rar->packed_size);
+   return ret;
+ }
+ 
+@@ -2004,6 +2451,13 @@ read_data_stored(struct archive_read *a, const void **buff, size_t *size,
+ {
+   struct rar *rar = a->format->data;
+   ssize_t bytes_avail;
++  int ret;
++
++  if (rar->datacrypt.active && rar->offset_seek >= rar->unp_size) {
++    ret = rar4_datacrypt_finish(a, rar);
++    if (ret != ARCHIVE_OK)
++      return ret;
++  }
+ 
+   if (rar->bytes_remaining == 0 &&
+     !(rar->main_flags & MHD_VOLUME && rar->file_flags & FHD_SPLIT_AFTER))
+@@ -2030,6 +2484,9 @@ read_data_stored(struct archive_read *a, const void **buff, size_t *size,
+     return (ARCHIVE_FAILED);
+   }
+ 
++  if (bytes_avail > rar->unp_size - rar->offset_seek)
++    bytes_avail = (ssize_t)(rar->unp_size - rar->offset_seek);
++
+   *size = bytes_avail;
+   *offset = rar->offset;
+   rar->offset += bytes_avail;
+@@ -2104,6 +2561,11 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+       *buff = NULL;
+       *size = 0;
+       *offset = rar->offset;
++      if (rar->datacrypt.active) {
++        ret = rar4_datacrypt_finish(a, rar);
++        if (ret != ARCHIVE_OK)
++          return ret;
++      }
+       if (rar->file_crc != rar->crc_calculated) {
+ #ifndef DONT_FAIL_ON_CRC_ERROR
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+@@ -3237,7 +3699,15 @@ rar_read_ahead(struct archive_read *a, size_t min, ssize_t *avail)
+   int ret;
+ 
+ again:
++  if (rar->datacrypt.active) {
++    if (rar4_datacrypt_fill(a, rar, min) != ARCHIVE_OK)
++      return NULL;
++    h = rar->datacrypt.buf + rar->datacrypt.buf_pos;
++    if (avail != NULL)
++      *avail = (ssize_t)(rar->datacrypt.buf_len - rar->datacrypt.buf_pos);
++  } else {
+   h = __archive_read_ahead(a, min, avail);
++  }
+ 
+   if (avail)
+   {
