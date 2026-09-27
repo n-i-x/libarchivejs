@@ -61,7 +61,11 @@ RUN unzip -q /opt/libarchive-${LIBARCHIVE_VERSION}.zip -d /opt && rm /opt/libarc
 
 # Local patches to libarchive, applied before the build. Upstream libarchive has
 # no RAR decryption -- it detects encrypted entries and refuses them -- so this
-# project carries that support here. Keep each patch focused and
+# project carries that support here (0001-0005). 0006-0008 fix RAR4 archives
+# made with -m5 that mix LZSS and PPMd blocks, which upstream 3.8.9 extracts
+# corrupted or not at all: a PPMd block zeroed the LZSS window, a later block's
+# escape character was reset, and filters inside PPMd blocks were unsupported.
+# Keep each patch focused and
 # rebased when LIBARCHIVE_VERSION moves; a patch that no longer applies fails the
 # build loudly rather than silently producing a wasm without the feature.
 #

@@ -1,0 +1,23 @@
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -2481,6 +2481,7 @@ read_header(struct archive_read *a, struct archive_entry *entry,
+   memset(rar->lengthtable, 0, sizeof(rar->lengthtable));
+   __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
+   rar->ppmd_valid = rar->ppmd_eod = 0;
++  rar->ppmd_escape = 2;
+   rar->filters.filterstart = INT64_MAX;
+ 
+   archive_entry_set_mtime(entry, rar->mtime, rar->mnsec);
+@@ -3021,8 +3022,10 @@ parse_codes(struct archive_read *a)
+       rar->ppmd_escape = rar->ppmd7_context.InitEsc = rar_br_bits(br, 8);
+       rar_br_consume(br, 8);
+     }
+-    else
+-      rar->ppmd_escape = 2;
++    /* Otherwise the escape carries over from the previous PPMd block, as
++     * unrar's does; it starts at 2 for each entry (read_header). Resetting it
++     * here decoded a later block that did not restate it with the wrong
++     * escape, and the stream desynchronised at once. */
+ 
+     if (ppmd_flags & 0x20)
+     {

@@ -1,0 +1,261 @@
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -476,6 +476,7 @@ static int make_table(struct archive_read *, struct huffman_code *);
+ static int make_table_recurse(struct archive_read *, struct huffman_code *, int,
+                               struct huffman_table_entry *, int, int);
+ static int expand(struct archive_read *, int64_t *);
++static int expand_ppmd(struct archive_read *, int64_t *);
+ static int copy_from_lzss_window_to_unp(struct archive_read *, const void **,
+                                         int64_t, size_t);
+ static const void *rar_read_ahead(struct archive_read *, size_t, ssize_t *);
+@@ -2728,7 +2729,7 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+   struct rar *rar = a->format->data;
+   int64_t start, end;
+   size_t bs;
+-  int ret = (ARCHIVE_OK), sym, code, lzss_offset, length, i;
++  int ret = (ARCHIVE_OK);
+ 
+   do {
+     if (!rar->valid)
+@@ -2760,7 +2761,7 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+       goto ending_block;
+     }
+ 
+-    if (rar->ppmd_eod ||
++    if ((rar->ppmd_eod && rar->bytes_uncopied == 0) ||
+        (rar->dictionary_size && rar->offset >= rar->unp_size))
+     {
+       if (rar->unp_offset > 0) {
+@@ -2796,7 +2797,7 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+       return (ARCHIVE_EOF);
+     }
+ 
+-    if (!rar->is_ppmd_block && rar->dictionary_size && rar->bytes_uncopied > 0)
++    if (rar->dictionary_size && rar->bytes_uncopied > 0)
+     {
+       if (rar->bytes_uncopied > (rar->unp_buffer_size - rar->unp_offset))
+         bs = rar->unp_buffer_size - rar->unp_offset;
+@@ -2833,88 +2834,6 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+     if (rar->start_new_table && ((ret = parse_codes(a)) < (ARCHIVE_WARN)))
+       return (ret);
+ 
+-    if (rar->is_ppmd_block)
+-    {
+-      if ((sym = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+-        &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+-      {
+-        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                          "Invalid symbol");
+-        return (ARCHIVE_FAILED);
+-      }
+-      if(sym != rar->ppmd_escape)
+-      {
+-        lzss_emit_literal(rar, sym);
+-        rar->bytes_uncopied++;
+-      }
+-      else
+-      {
+-        if ((code = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+-          &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+-        {
+-          archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                            "Invalid symbol");
+-          return (ARCHIVE_FAILED);
+-        }
+-
+-        switch(code)
+-        {
+-          case 0:
+-            rar->start_new_table = 1;
+-            return read_data_compressed(a, buff, size, offset, looper);
+-
+-          case 2:
+-            rar->ppmd_eod = 1;/* End Of ppmd Data. */
+-            continue;
+-
+-          case 3:
+-            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+-                              "Parsing filters is unsupported");
+-            return (ARCHIVE_FAILED);
+-
+-          case 4:
+-            lzss_offset = 0;
+-            for (i = 2; i >= 0; i--)
+-            {
+-              if ((code = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+-                &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+-              {
+-                archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                                  "Invalid symbol");
+-                return (ARCHIVE_FAILED);
+-              }
+-              lzss_offset |= code << (i * 8);
+-            }
+-            if ((length = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+-              &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+-            {
+-              archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                                "Invalid symbol");
+-              return (ARCHIVE_FAILED);
+-            }
+-            lzss_emit_match(rar, lzss_offset + 2, length + 32);
+-            rar->bytes_uncopied += length + 32;
+-            break;
+-
+-          case 5:
+-            if ((length = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+-              &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+-            {
+-              archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+-                                "Invalid symbol");
+-              return (ARCHIVE_FAILED);
+-            }
+-            lzss_emit_match(rar, 1, length + 4);
+-            rar->bytes_uncopied += length + 4;
+-            break;
+-
+-         default:
+-           lzss_emit_literal(rar, sym);
+-           rar->bytes_uncopied++;
+-        }
+-      }
+-    }
+-    else
+     {
+       start = rar->offset;
+       end = start + rar->dictionary_size;
+@@ -2941,6 +2860,8 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+ 
+       rar->bytes_uncopied = end - start;
+       rar->filters.lastend = end;
++      if (rar->ppmd_eod && rar->bytes_uncopied == 0)
++        continue;
+       if (rar->filters.lastend != rar->filters.filterstart && rar->bytes_uncopied == 0) {
+           /* Broken RAR files cause this case.
+           * NOTE: If this case were possible on a normal RAR file
+@@ -3601,6 +3522,96 @@ make_table_recurse(struct archive_read *a, struct huffman_code *code, int node,
+   return ret;
+ }
+ 
++/*
++ * Decode one PPMd symbol, or one escape sequence, into the LZSS window.
++ *
++ * This used to live in read_data_compressed, which decoded a symbol and copied
++ * it out straight away. That had no place for filters: a PPMd block that
++ * defined one (escape code 3) failed with "Parsing filters is unsupported",
++ * and run_filters, which decodes up to the end of a filter block through
++ * expand(), stopped short at the first PPMd block. Decoding here lets expand()
++ * run straight through PPMd data, so filter bookkeeping is the same for both
++ * block types.
++ *
++ * End of PPMd data sets ppmd_eod and pulls *end back to the current position.
++ */
++static int
++expand_ppmd(struct archive_read *a, int64_t *end)
++{
++  struct rar *rar = a->format->data;
++  int sym, code, length, i;
++  int lzss_offset;
++
++  if ((sym = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
++    &rar->ppmd7_context, &rar->range_dec.p)) < 0)
++    goto bad_symbol;
++  if (sym != rar->ppmd_escape)
++  {
++    lzss_emit_literal(rar, sym);
++    return (ARCHIVE_OK);
++  }
++
++  if ((code = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
++    &rar->ppmd7_context, &rar->range_dec.p)) < 0)
++    goto bad_symbol;
++
++  switch(code)
++  {
++    case 0:
++      /* New tables: the next block may be LZSS or PPMd. */
++      {
++        int r = parse_codes(a);
++        return (r < ARCHIVE_WARN ? r : ARCHIVE_OK);
++      }
++
++    case 2:
++      rar->ppmd_eod = 1;/* End Of ppmd Data. */
++      *end = lzss_position(&rar->lzss);
++      return (ARCHIVE_OK);
++
++    case 3:
++      /* A filter, coded as in an LZSS block but read through the model. */
++      if (!read_filter(a, end))
++      {
++        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++                          "Bad RAR file data");
++        return (ARCHIVE_FAILED);
++      }
++      return (ARCHIVE_OK);
++
++    case 4:
++      lzss_offset = 0;
++      for (i = 2; i >= 0; i--)
++      {
++        if ((code = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
++          &rar->ppmd7_context, &rar->range_dec.p)) < 0)
++          goto bad_symbol;
++        lzss_offset |= code << (i * 8);
++      }
++      if ((length = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
++        &rar->ppmd7_context, &rar->range_dec.p)) < 0)
++        goto bad_symbol;
++      lzss_emit_match(rar, lzss_offset + 2, length + 32);
++      return (ARCHIVE_OK);
++
++    case 5:
++      if ((length = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
++        &rar->ppmd7_context, &rar->range_dec.p)) < 0)
++        goto bad_symbol;
++      lzss_emit_match(rar, 1, length + 4);
++      return (ARCHIVE_OK);
++
++    default:
++      lzss_emit_literal(rar, sym);
++      return (ARCHIVE_OK);
++  }
++
++bad_symbol:
++  archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++                    "Invalid symbol");
++  return (ARCHIVE_FAILED);
++}
++
+ static int
+ expand(struct archive_read *a, int64_t *end)
+ {
+@@ -3659,8 +3670,10 @@ expand(struct archive_read *a, int64_t *end)
+     }
+ 
+     if(rar->is_ppmd_block) {
+-      *end = lzss_position(&rar->lzss);
+-      return (ARCHIVE_OK);
++      int r = expand_ppmd(a, end);
++      if (r != ARCHIVE_OK)
++        return (r);
++      continue;
+     }
+ 
+     if ((symbol = read_next_symbol(a, &rar->maincode)) < 0)
+@@ -4607,6 +4620,15 @@ rar_decode_byte(struct archive_read *a, uint8_t *byte)
+ {
+   struct rar *rar = a->format->data;
+   struct rar_br *br = &(rar->br);
++  if (rar->is_ppmd_block)
++  {
++    int sym = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
++      &rar->ppmd7_context, &rar->range_dec.p);
++    if (sym < 0)
++      return 0;
++    *byte = (uint8_t)sym;
++    return 1;
++  }
+   if (!rar_br_read_ahead(a, br, 8))
+     return 0;
+   *byte = (uint8_t)rar_br_bits(br, 8);

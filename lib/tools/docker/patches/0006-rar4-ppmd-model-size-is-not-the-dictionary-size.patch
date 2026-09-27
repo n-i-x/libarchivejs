@@ -1,0 +1,47 @@
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -2981,7 +2981,7 @@ parse_codes(struct archive_read *a)
+   struct rar *rar = a->format->data;
+   int i, j, val, n, r;
+   unsigned char bitlengths[MAX_SYMBOLS], zerocount, ppmd_flags;
+-  unsigned int maxorder;
++  unsigned int maxorder, ppmd_memory_size = 0;
+   struct huffman_code precode;
+   struct rar_br *br = &(rar->br);
+ 
+@@ -3001,12 +3001,16 @@ parse_codes(struct archive_read *a)
+     ppmd_flags = rar_br_bits(br, 7);
+     rar_br_consume(br, 7);
+ 
+-    /* Memory is allocated in MB */
++    /* Memory is allocated in MB. This is the PPMd model's memory, not the
++     * LZSS window: storing it in dictionary_size made the window check
++     * below see a "larger dictionary" and reallocate - and zero - a window
++     * still holding decoded but uncopied bytes and the history later LZSS
++     * blocks refer back to. */
+     if (ppmd_flags & 0x20)
+     {
+       if (!rar_br_read_ahead(a, br, 8))
+         goto truncated_data;
+-      rar->dictionary_size = (rar_br_bits(br, 8) + 1) << 20;
++      ppmd_memory_size = (rar_br_bits(br, 8) + 1) << 20;
+       rar_br_consume(br, 8);
+     }
+ 
+@@ -3043,14 +3047,14 @@ parse_codes(struct archive_read *a)
+       rar->range_dec.Stream = &rar->bytein;
+       __archive_ppmd7_functions.Ppmd7_Construct(&rar->ppmd7_context);
+ 
+-      if (rar->dictionary_size == 0) {
++      if (ppmd_memory_size == 0) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                           "Invalid zero dictionary size");
+         return (ARCHIVE_FAILED);
+       }
+ 
+       if (!__archive_ppmd7_functions.Ppmd7_Alloc(&rar->ppmd7_context,
+-        rar->dictionary_size))
++        ppmd_memory_size))
+       {
+         archive_set_error(&a->archive, ENOMEM,
+                           "Out of memory");
