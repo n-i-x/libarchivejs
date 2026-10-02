@@ -65,6 +65,8 @@ RUN unzip -q /opt/libarchive-${LIBARCHIVE_VERSION}.zip -d /opt && rm /opt/libarc
 # made with -m5 that mix LZSS and PPMd blocks, which upstream 3.8.9 extracts
 # corrupted or not at all: a PPMd block zeroed the LZSS window, a later block's
 # escape character was reset, and filters inside PPMd blocks were unsupported.
+# 0009 makes RAR5 entry sizes 64-bit: they were ssize_t, which on wasm32 caps an
+# entry at 2 GiB, so an archive holding a larger one would not even list.
 # Keep each patch focused and
 # rebased when LIBARCHIVE_VERSION moves; a patch that no longer applies fails the
 # build loudly rather than silently producing a wasm without the feature.

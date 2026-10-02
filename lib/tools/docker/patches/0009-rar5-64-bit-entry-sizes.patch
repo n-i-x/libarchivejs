@@ -1,0 +1,73 @@
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index 1ac9fe6..062a653 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -94,8 +94,10 @@ static const size_t g_unpack_window_size = 0x20000;
+ #define MAX_NAME_IN_BYTES (4 * MAX_NAME_IN_CHARS)
+ 
+ struct file_header {
+-	ssize_t bytes_remaining;
+-	ssize_t unpacked_size;
++	/* 64-bit, not ssize_t: on a 32-bit target (wasm32) ssize_t caps an
++	 * entry at 2 GiB, and PUP packs routinely carry larger ones. */
++	int64_t bytes_remaining;
++	int64_t unpacked_size;
+ 	int64_t last_offset;         /* Used in sanity checks. */
+ 	int64_t last_size;           /* Used in sanity checks. */
+ 
+@@ -2091,7 +2093,7 @@ static int process_head_file_extra(struct archive_read* a,
+ 
+ static int file_entry_sanity_checks(struct archive_read* a,
+ 	size_t block_flags, uint8_t is_dir, uint64_t unpacked_size,
+-	size_t packed_size)
++	uint64_t packed_size)
+ {
+ 	if (is_dir) {
+ 		const int declares_data_size =
+@@ -2120,7 +2122,7 @@ static int process_head_file(struct archive_read* a, struct rar5 *rar5,
+     struct archive_entry* entry, size_t block_flags)
+ {
+ 	int64_t extra_data_size = 0;
+-	size_t data_size = 0;
++	uint64_t data_size = 0;
+ 	size_t file_flags = 0;
+ 	size_t file_attr = 0;
+ 	size_t compression_info = 0;
+@@ -2169,17 +2171,19 @@ static int process_head_file(struct archive_read* a, struct rar5 *rar5,
+ 	}
+ 
+ 	if(block_flags & HFL_DATA) {
+-		if(!read_var_sized(a, &data_size, NULL))
++		/* read_var, not read_var_sized: size_t would truncate the
++		 * value on a 32-bit target. */
++		if(!read_var(a, &data_size, NULL))
+ 			return ARCHIVE_EOF;
+ 
+-		if(data_size > SSIZE_MAX) {
++		if(data_size > INT64_MAX) {
+ 			archive_set_error(&a->archive,
+ 			    ARCHIVE_ERRNO_FILE_FORMAT,
+ 			    "File data size is too large");
+ 			return ARCHIVE_FATAL;
+ 		}
+ 
+-		rar5->file.bytes_remaining = data_size;
++		rar5->file.bytes_remaining = (int64_t) data_size;
+ 	} else {
+ 		rar5->file.bytes_remaining = 0;
+ 	}
+@@ -2410,7 +2414,13 @@ static int process_head_file(struct archive_read* a, struct rar5 *rar5,
+ 	}
+ 
+ 	if((file_flags & UNKNOWN_UNPACKED_SIZE) == 0) {
+-		rar5->file.unpacked_size = (ssize_t) unpacked_size;
++		if(unpacked_size > INT64_MAX) {
++			archive_set_error(&a->archive,
++			    ARCHIVE_ERRNO_FILE_FORMAT,
++			    "File unpacked size is too large");
++			return ARCHIVE_FATAL;
++		}
++		rar5->file.unpacked_size = (int64_t) unpacked_size;
+ 		if(rar5->file.redir_type == REDIR_TYPE_NONE)
+ 			archive_entry_set_size(entry, unpacked_size);
+ 	}
